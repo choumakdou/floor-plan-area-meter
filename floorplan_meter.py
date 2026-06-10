@@ -34,9 +34,14 @@ from tkinter import colorchooser, filedialog, messagebox, ttk
 
 # Build metadata — stamped by the GitHub Actions workflow on every build.
 # When running from source these fall back to the dev defaults below.
-__version__ = "dev"
+__version__ = "2.0.0-editor"
 __build__ = "local"
 __built_at__ = ""
+
+# Author / brand credit.  Shown in the window title and Help -> About.
+APP_TITLE = "Floor Plan Area Meter"
+APP_AUTHOR = "Bobby Mak"
+APP_COMPANY = "CHFT Surveyors"
 from typing import List, Optional, Tuple
 
 try:
@@ -171,7 +176,7 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("Floor Plan Area Meter")
+        self.title(f"{APP_TITLE}  —  {APP_AUTHOR}, {APP_COMPANY}")
         self.geometry("1280x820")
         self.minsize(900, 600)
 
@@ -185,10 +190,17 @@ class App(tk.Tk):
         self._pan_start = (0.0, 0.0)
 
         self.calib = Calibration()
-        self.mode = tk.StringVar(value="polygon")     # 'polygon' | 'calibV' | 'calibH'
+        self.mode = tk.StringVar(value="polygon")     # 'polygon' | 'calibV' | 'calibH' | 'edit'
+        self.input_mode = tk.StringVar(value="draw")  # 'draw' | 'pan'  (interaction mode)
         self.unit_var = tk.StringVar(value="m²")
         self.show_labels = tk.BooleanVar(value=True)
         self.show_calib = tk.BooleanVar(value=True)
+
+        # Edit-mode state
+        self.selected_polygon: Optional[int] = None
+        self.selected_vertex: Optional[int] = None
+        self._dragging_vertex = False
+        self._hover_edge: Optional[Tuple[int, int]] = None  # (poly_idx, edge_idx)
 
         # polygons: list of dicts {poly, color, name}
         self.polygons: List[dict] = []
@@ -218,10 +230,20 @@ class App(tk.Tk):
         ttk.Label(tb, text="Mode:").pack(side=tk.LEFT)
         ttk.Radiobutton(tb, text="Polygon", variable=self.mode,
                         value="polygon", command=self._on_mode_change).pack(side=tk.LEFT)
+        ttk.Radiobutton(tb, text="Edit", variable=self.mode,
+                        value="edit", command=self._on_mode_change).pack(side=tk.LEFT)
         ttk.Radiobutton(tb, text="Calibrate V", variable=self.mode,
                         value="calibV", command=self._on_mode_change).pack(side=tk.LEFT)
         ttk.Radiobutton(tb, text="Calibrate H", variable=self.mode,
                         value="calibH", command=self._on_mode_change).pack(side=tk.LEFT)
+        ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        # Draw / Pan toggle (Adobe-style interaction switch)
+        self.input_mode_btn = ttk.Checkbutton(
+            tb, text="Pan mode", variable=self.input_mode,
+            onvalue="pan", offvalue="draw",
+            command=self._on_input_mode_change)
+        self.input_mode_btn.pack(side=tk.LEFT, padx=2)
         ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
         ttk.Label(tb, text="Units:").pack(side=tk.LEFT)
@@ -340,18 +362,25 @@ class App(tk.Tk):
         plf.pack(fill=tk.BOTH, expand=True, pady=4)
         self.poly_list = tk.Listbox(plf, height=10, exportselection=False)
         self.poly_list.pack(fill=tk.BOTH, expand=True)
-        self.poly_list.bind("<<ListboxSelect>>", lambda e: self.redraw())
+        self.poly_list.bind("<<ListboxSelect>>", self._on_poly_list_select)
 
         # ----- legend / tips -----
         tips = ttk.LabelFrame(side, text="Tips", padding=8)
         tips.pack(fill=tk.X, pady=4)
         ttk.Label(tips, justify=tk.LEFT, text=(
-            "• Left-click: place point / set reference\n"
-            "• Right-click: close current polygon\n"
+            "• Draw mode: left-click = place point\n"
+            "• Pan mode: left-drag = pan the canvas\n"
+            "• Mouse-wheel: zoom (Ctrl+wheel for finer)\n"
+            "• Middle-drag or Space+drag: pan (always)\n"
+            "• Arrow keys: nudge view\n"
+            "• Right-click: close polygon / delete vertex (Edit)\n"
             "• Enter: close polygon\n"
             "• Esc: cancel current polygon\n"
-            "• Mouse-wheel: zoom (Ctrl+wheel for finer)\n"
-            "• Middle-drag or Space+drag: pan"
+            "\n"
+            "Edit mode:\n"
+            "• Click a vertex to select (drag to move)\n"
+            "• Double-click an edge to insert a vertex\n"
+            "• Right-click a vertex to delete it (>=4 remain)"
         )).pack(anchor=tk.W)
 
         # Status bar
@@ -373,6 +402,8 @@ class App(tk.Tk):
         self.canvas.bind("<B2-Motion>", self.on_pan_move)
         self.canvas.bind("<ButtonRelease-2>", self.on_pan_end)
         self.canvas.bind("<Motion>", self.on_motion)
+        self.canvas.bind("<ButtonRelease-1>", self.on_left_release)
+        self.canvas.bind("<Double-Button-1>", self.on_double_click)
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)        # win/mac
         self.canvas.bind("<Button-4>", lambda e: self.zoom_by(self.ZOOM_STEP))   # linux
         self.canvas.bind("<Button-5>", lambda e: self.zoom_by(1 / self.ZOOM_STEP))
@@ -381,6 +412,8 @@ class App(tk.Tk):
         self.bind("<Escape>", lambda e: self.clear_current())
         self.bind("<space>", self._on_space_press)
         self.bind("<KeyRelease-space>", self._on_space_release)
+        for k in ("Left", "Right", "Up", "Down"):
+            self.bind(f"<{k}>", self._on_arrow_pan)
 
     def _on_space_press(self, event):
         self.canvas.config(cursor="fleur")
@@ -388,6 +421,19 @@ class App(tk.Tk):
     def _on_space_release(self, event):
         self.canvas.config(cursor="")
         self._panning = False
+
+    def _on_arrow_pan(self, event):
+        if self.image is None:
+            return
+        step = 40
+        dx, dy = 0, 0
+        if event.keysym == "Left":  dx =  step
+        if event.keysym == "Right": dx = -step
+        if event.keysym == "Up":    dy =  step
+        if event.keysym == "Down":  dy = -step
+        ox, oy = self.offset
+        self.offset = (ox + dx, oy + dy)
+        self._schedule_redraw()
 
     # ------------------------------------------------------------------
     # Image loading
@@ -499,6 +545,14 @@ class App(tk.Tk):
             return
         ix, iy = self.canvas_to_image(event.x, event.y)
         mode = self.mode.get()
+
+        # In pan mode, a left click starts a pan (acts like middle-drag).
+        if self.input_mode.get() == "pan":
+            self._panning = True
+            self._pan_start = (event.x, event.y)
+            self._pan_origin = self.offset
+            return
+
         if mode == "calibV":
             if self.calib.p1 is None:
                 self.calib.p1 = (ix, iy)
@@ -511,17 +565,83 @@ class App(tk.Tk):
             elif self.calib.p4 is None:
                 self.calib.p4 = (ix, iy)
             self._refresh_calib_entries()
+        elif mode == "edit":
+            hit = self._hit_test_polygon(ix, iy, tol_px=10.0)
+            if hit is None:
+                self.selected_polygon = None
+                self.selected_vertex = None
+            else:
+                pi, vi = hit
+                self.selected_polygon = pi
+                self.selected_vertex = vi
+                self._dragging_vertex = True
+                if 0 <= pi < self.poly_list.size():
+                    self.poly_list.selection_clear(0, tk.END)
+                    self.poly_list.selection_set(pi)
         else:  # polygon
             self.current_poly.append((ix, iy))
         self._schedule_redraw()
 
+    def on_left_release(self, event):
+        self._dragging_vertex = False
+        self._panning = False
+
+    def on_double_click(self, event):
+        if self.image is None or self.mode.get() != "edit":
+            return
+        ix, iy = self.canvas_to_image(event.x, event.y)
+        edge = self._hit_test_edge(ix, iy, tol_px=10.0)
+        if edge is None:
+            return
+        pi, ei = edge
+        poly = self.polygons[pi]["poly"]
+        new_vi = (ei + 1) % len(poly)
+        poly.insert(new_vi, (ix, iy))
+        self.selected_polygon = pi
+        self.selected_vertex = new_vi
+        self._schedule_redraw()
+
     def on_right_click(self, event):
+        if self.mode.get() == "edit" and self.selected_polygon is not None and self.selected_vertex is not None:
+            poly = self.polygons[self.selected_polygon]["poly"]
+            if len(poly) > 3:
+                del poly[self.selected_vertex]
+                self.selected_vertex = None
+                self._schedule_redraw()
+                return
         self.close_polygon()
 
     def on_motion(self, event):
         if self.image is None:
             return
         self._hover_point = self.canvas_to_image(event.x, event.y)
+
+        # Live pan with left button in pan mode
+        if self._panning and self.input_mode.get() == "pan" and getattr(self, "_pan_origin", None) is not None:
+            dx = event.x - self._pan_start[0]
+            dy = event.y - self._pan_start[1]
+            ox0, oy0 = self._pan_origin
+            self.offset = (ox0 + dx, oy0 + dy)
+            self._schedule_redraw()
+            return
+
+        # Live vertex drag in edit mode
+        if self._dragging_vertex and self.mode.get() == "edit" \
+                and self.selected_polygon is not None and self.selected_vertex is not None:
+            ix, iy = self.canvas_to_image(event.x, event.y)
+            poly = self.polygons[self.selected_polygon]["poly"]
+            if 0 <= self.selected_vertex < len(poly):
+                poly[self.selected_vertex] = (ix, iy)
+                self._schedule_redraw()
+            return
+
+        # Edge hover (for insert-vertex hint)
+        if self.mode.get() == "edit":
+            ix, iy = self.canvas_to_image(event.x, event.y)
+            self._hover_edge = self._hit_test_edge(ix, iy, tol_px=8.0)
+        else:
+            self._hover_edge = None
+
         if self.current_poly and self.mode.get() == "polygon":
             self._schedule_redraw()
         else:
@@ -612,6 +732,9 @@ class App(tk.Tk):
         self.polygons.pop()
         if self.poly_list.size() > 0:
             self.poly_list.delete(tk.END)
+        if self.selected_polygon is not None and self.selected_polygon >= len(self.polygons):
+            self.selected_polygon = None
+            self.selected_vertex = None
         self._schedule_redraw()
 
     def clear_all_polygons(self) -> None:
@@ -622,6 +745,8 @@ class App(tk.Tk):
         self.polygons.clear()
         self.current_poly.clear()
         self.poly_list.delete(0, tk.END)
+        self.selected_polygon = None
+        self.selected_vertex = None
         self._schedule_redraw()
 
     # ------------------------------------------------------------------
@@ -629,6 +754,25 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
     def _on_mode_change(self) -> None:
         self.current_poly.clear()
+        self.selected_polygon = None
+        self.selected_vertex = None
+        self._schedule_redraw()
+
+    def _on_input_mode_change(self) -> None:
+        if self.input_mode.get() == "pan":
+            self.canvas.config(cursor="fleur")
+        else:
+            self.canvas.config(cursor="crosshair" if self.mode.get() == "polygon" else "")
+        self._update_status()
+
+    def _on_poly_list_select(self, _event=None) -> None:
+        sel = self.poly_list.curselection()
+        if not sel:
+            self.selected_polygon = None
+            self.selected_vertex = None
+        else:
+            self.selected_polygon = sel[0]
+            self.selected_vertex = None
         self._schedule_redraw()
 
     # ------------------------------------------------------------------
@@ -718,6 +862,8 @@ class App(tk.Tk):
         # Labels (drawn on top in canvas coords; easier crispness)
         if self.show_labels.get():
             self._draw_labels()
+        if self.mode.get() == "edit":
+            self._draw_edit_handles()
 
         # Calibration markers
         if self.show_calib.get():
@@ -740,6 +886,77 @@ class App(tk.Tk):
                 ccx, ccy, text=f"{p['name']}\n{text}",
                 fill="white", justify=tk.CENTER, font=("Segoe UI", 10, "bold"),
             )
+
+    # ------------------------------------------------------------------
+    # Edit mode: hit testing & vertex handles
+    # ------------------------------------------------------------------
+    def _hit_test_polygon(self, ix, iy, tol_px=8.0):
+        """Return (poly_idx, vertex_idx) of the closest vertex within tol_px
+        (image-pixel space), or None."""
+        best = None
+        best_d2 = tol_px * tol_px
+        for pi, p in enumerate(self.polygons):
+            for vi, (x, y) in enumerate(p["poly"]):
+                d2 = (x - ix) ** 2 + (y - iy) ** 2
+                if d2 <= best_d2:
+                    best = (pi, vi)
+                    best_d2 = d2
+        return best
+
+    def _point_to_segment_dist(self, px, py, ax, ay, bx, by):
+        """Perpendicular distance from (px,py) to segment (ax,ay)-(bx,by)."""
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy
+        if L2 == 0:
+            return math.hypot(px - ax, py - ay)
+        t = ((px - ax) * dx + (py - ay) * dy) / L2
+        t = max(0.0, min(1.0, t))
+        qx, qy = ax + t * dx, ay + t * dy
+        return math.hypot(px - qx, py - qy)
+
+    def _hit_test_edge(self, ix, iy, tol_px=8.0):
+        """Return (poly_idx, edge_idx) of the closest edge within tol_px."""
+        best = None
+        best_d = tol_px
+        for pi, p in enumerate(self.polygons):
+            poly = p["poly"]
+            n = len(poly)
+            for vi in range(n):
+                ax, ay = poly[vi]
+                bx, by = poly[(vi + 1) % n]
+                d = self._point_to_segment_dist(ix, iy, ax, ay, bx, by)
+                if d <= best_d:
+                    best = (pi, vi)
+                    best_d = d
+        return best
+
+    def _draw_edit_handles(self) -> None:
+        for pi, p in enumerate(self.polygons):
+            is_selected = (pi == self.selected_polygon)
+            for vi, (x, y) in enumerate(p["poly"]):
+                cx, cy = self.image_to_canvas(x, y)
+                if is_selected and vi == self.selected_vertex:
+                    r = 8
+                    self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                            fill="white", outline="black", width=2)
+                    self.canvas.create_text(
+                        cx + 12, cy - 12, anchor=tk.NW,
+                        text=f"({x:.1f}, {y:.1f})",
+                        fill="yellow", font=("Consolas", 9, "bold"))
+                else:
+                    r = 5
+                    fill = "white" if is_selected else "#222"
+                    self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                            fill=fill, outline=p["color"], width=2)
+            if self._hover_edge is not None and self._hover_edge[0] == pi:
+                _, ei = self._hover_edge
+                ax, ay = p["poly"][ei]
+                bx, by = p["poly"][(ei + 1) % len(p["poly"])]
+                mx, my = (ax + bx) / 2, (ay + by) / 2
+                cmx, cmy = self.image_to_canvas(mx, my)
+                r = 4
+                self.canvas.create_oval(cmx - r, cmy - r, cmx + r, cmy + r,
+                                        fill="yellow", outline="black", width=1)
 
     def _draw_calib(self) -> None:
         c = self.calib
@@ -778,8 +995,17 @@ class App(tk.Tk):
         iw, ih = self.image.size
         n = len(self.polygons)
         cur = len(self.current_poly)
-        bits = [f"image: {iw}×{ih} px", f"zoom: {self.zoom*100:.0f}%",
-                f"polygons: {n}", f"current pts: {cur}"]
+        mode = self.mode.get()
+        inm = self.input_mode.get().upper()
+        bits = [
+            f"{APP_TITLE} — {APP_AUTHOR}, {APP_COMPANY}",
+            f"image: {iw}×{ih} px",
+            f"mode: {mode}",
+            f"input: {inm}",
+            f"zoom: {self.zoom*100:.0f}%",
+            f"polygons: {n}",
+            f"current pts: {cur}",
+        ]
         self.status.set("   |   ".join(bits))
 
     # ------------------------------------------------------------------
@@ -790,13 +1016,18 @@ class App(tk.Tk):
         build = globals().get("__build__", "local")
         built = globals().get("__built_at__", "")
         messagebox.showinfo(
-            "About",
-            f"Floor Plan Area Meter\n"
+            f"About — {APP_TITLE}",
+            f"{APP_TITLE}\n"
+            f"\n"
+            f"Created by:  {APP_AUTHOR}\n"
+            f"Company:     {APP_COMPANY}\n"
+            f"\n"
             f"Version: {ver}\n"
             f"Build:   {build}\n"
-            f"Built:   {built}\n\n"
+            f"Built:   {built or '(local source)'}\n"
+            f"\n"
             f"MIT License\n"
-            f"https://github.com/USER/REPO",
+            f"https://github.com/choumakdou/floor-plan-area-meter",
         )
 
     # ------------------------------------------------------------------

@@ -1,0 +1,91 @@
+name: Build Windows EXE
+
+# Triggers on every push to main (and on tags + manual runs).
+# On a normal commit, the .exe is uploaded as a workflow artifact.
+# On a tag push (v*), it is ALSO attached to a GitHub Release.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Stamp version into the app
+        shell: bash
+        run: |
+          {
+            echo ""
+            echo "# --- build metadata ---"
+            echo "__version__ = \"${{ github.ref_name }}\""
+            echo "__build__   = \"${{ github.sha }}\""
+            echo "__built_at__ = \"$(date -u +%FT%TZ)\""
+          } >> floorplan_meter.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name FloorPlanMeter floorplan_meter.py
+
+      - name: Verify the .exe exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\FloorPlanMeter.exe")) {
+            Write-Error "Build did not produce dist\FloorPlanMeter.exe"
+            exit 1
+          }
+          Get-Item "dist\FloorPlanMeter.exe" | Format-List Name, Length, LastWriteTime
+
+      - name: Zip the .exe with README + LICENSE
+        shell: bash
+        run: |
+          cd dist
+          cp ../LICENSE .
+          cp ../README.md .
+          cp ../requirements.txt .
+          7z a FloorPlanMeter-windows.zip FloorPlanMeter.exe LICENSE README.md requirements.txt \
+            || zip -r FloorPlanMeter-windows.zip FloorPlanMeter.exe LICENSE README.md requirements.txt
+          ls -la FloorPlanMeter-windows.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FloorPlanMeter-windows
+          path: |
+            dist/FloorPlanMeter.exe
+            dist/FloorPlanMeter-windows.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach to GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/FloorPlanMeter.exe
+            dist/FloorPlanMeter-windows.zip

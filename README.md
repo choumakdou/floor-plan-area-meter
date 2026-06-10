@@ -5,7 +5,7 @@ A small Python desktop app for measuring room areas on a floor plan image.
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
-![Build](https://img.shields.io/github/actions/workflow/status/USER/REPO/build.yml?label=build)
+![Build](https://img.shields.io/github/actions/workflow/status/choumakdou/floor-plan-area-meter/build.yml?label=build)
 
 ## Features
 
@@ -81,6 +81,14 @@ git push origin v1.0.0
 | Zoom | mouse-wheel (Ctrl+wheel = fine) |
 | Pan | middle-drag, or hold **Space** + drag |
 | Toggle units | toolbar ▸ *Units* dropdown |
+
+## What's new in v2.0
+
+- **Draggable polygon vertices** — switch to **Edit** mode, click a vertex to select it, drag to move. Live area updates as you drag.
+- **Insert / delete vertices** — in Edit mode, double-click an edge to insert a new vertex; right-click a vertex to delete it (rooms keep >= 3 vertices).
+- **Draw / Pan mode toggle** — Adobe-style: when Pan mode is on, left-drag pans the canvas (no more accidentally placing a vertex when you meant to pan). Middle-drag, Space+drag, and arrow keys still pan regardless of mode.
+- **Author credit in the UI** — title bar and Help → About both show "Bobby Mak, CHFT Surveyors".
+- Version bumped to `2.0.0`.
 
 ## Calibration 101
 

@@ -27,13 +27,29 @@ jobs:
       - name: Stamp version into the app
         shell: bash
         run: |
-          {
-            echo ""
-            echo "# --- build metadata ---"
-            echo "__version__ = \"${{ github.ref_name }}\""
-            echo "__build__   = \"${{ github.sha }}\""
-            echo "__built_at__ = \"$(date -u +%FT%TZ)\""
-          } >> floorplan_meter.py
+          # Idempotently replace (or append on first build) the metadata block.
+          # GitHub expands ${{ }} placeholders *before* this step runs.
+          python - <<'PY'
+          import os, re, pathlib, datetime
+          ref   = os.environ["GITHUB_REF_NAME"]
+          sha   = os.environ["GITHUB_SHA"]
+          stamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+          p = pathlib.Path("floorplan_meter.py")
+          src = p.read_text(encoding="utf-8")
+          block_re = re.compile(r"# --- build metadata ---.*?__built_at__ = \"[^\"]*\"\n", re.S)
+          new_block = (
+              "# --- build metadata ---\n"
+              "__version__ = \"" + ref + "\"\n"
+              "__build__ = \"" + sha + "\"\n"
+              "__built_at__ = \"" + stamp + "\"\n"
+          )
+          if block_re.search(src):
+              src = block_re.sub(new_block, src, count=1)
+          else:
+              src = src.rstrip() + "\n\n" + new_block
+          p.write_text(src, encoding="utf-8")
+          print("stamped:", ref, sha, stamp)
+          PY
 
       - name: Set up Python
         uses: actions/setup-python@v5

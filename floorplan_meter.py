@@ -30,19 +30,20 @@ import math
 import os
 import random
 import tkinter as tk
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk, simpledialog
+from typing import Any, Dict, List, Optional, Tuple
 
 # Build metadata — stamped by the GitHub Actions workflow on every build.
 # When running from source these fall back to the dev defaults below.
-__version__ = "2.0.0-editor"
+# --- build metadata ---
+__version__ = "2.1.0-measurement"
 __build__ = "local"
 __built_at__ = ""
 
 # Author / brand credit.  Shown in the window title and Help -> About.
 APP_TITLE = "Floor Plan Area Meter"
-APP_AUTHOR = "Bobby Mak"
-APP_COMPANY = "CHFT Surveyors"
-from typing import List, Optional, Tuple
+APP_AUTHOR = ""
+APP_COMPANY = "CHFT"
 
 try:
     from PIL import Image, ImageTk, ImageDraw
@@ -53,6 +54,98 @@ except ImportError:  # pragma: no cover
 
 Point = Tuple[float, float]
 Polygon = List[Point]
+
+
+# ---------------------------------------------------------------------------
+# v2.1: Measurement sheet — arithmetic L x W breakdown of room areas.
+# Mirrors the structure of the user's CHFT Excel "221 1F to print (draft)"
+# sheet: each row is a (sub-)rectangle or (sub-)triangle of a room, with
+# sub-segment H and V inputs in feet + inches, a shape factor, and an
+# optional link to a polygon for cross-check.
+# ---------------------------------------------------------------------------
+SHAPE_RECT = "rectangle"
+SHAPE_TRI  = "triangle"
+SHAPE_FACTORS = {SHAPE_RECT: 1.0, SHAPE_TRI: 0.5}
+
+
+class MeasurementRow:
+    """One row in the measurement sheet.
+
+    A row decomposes a room (or a sub-portion of one) into a primitive shape
+    whose area is H_feet * V_feet * factor.  Sub-segments let you build a
+    composite measurement out of several smaller lengths added together,
+    exactly like the user's Excel formulas:
+        H = E10 + H10 + K10 + (F10 + I10 + L10) / 12
+    """
+
+    __slots__ = (
+        "id", "description", "shape", "factor",
+        "h_subs",      # 3 (ft, in) pairs
+        "v_subs",      # 3 (ft, in) pairs
+        "polygon_idx", # optional index into App.polygons, or None
+    )
+
+    _next_id = 1
+
+    def __init__(self,
+                 description: str = "",
+                 shape: str = SHAPE_RECT,
+                 h_subs: Optional[List[Tuple[float, float]]] = None,
+                 v_subs: Optional[List[Tuple[float, float]]] = None,
+                 polygon_idx: Optional[int] = None) -> None:
+        self.id = MeasurementRow._next_id
+        MeasurementRow._next_id += 1
+        self.description = description or f"Row {self.id}"
+        self.shape = shape if shape in SHAPE_FACTORS else SHAPE_RECT
+        self.factor = SHAPE_FACTORS[self.shape]
+        # Pad/truncate sub-segments to exactly 3 pairs of (feet, inches).
+        self.h_subs = self._normalise_subs(h_subs)
+        self.v_subs = self._normalise_subs(v_subs)
+        self.polygon_idx = polygon_idx
+
+    @staticmethod
+    def _normalise_subs(subs):
+        out = [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
+        if subs:
+            for i, v in enumerate(subs[:3]):
+                if isinstance(v, (list, tuple)) and len(v) == 2:
+                    out[i] = (float(v[0]), float(v[1]))
+        return out
+
+    # ------------------------------------------------------------------
+    def h_feet_total(self) -> float:
+        return sum(ft + inch / 12.0 for ft, inch in self.h_subs)
+
+    def v_feet_total(self) -> float:
+        return sum(ft + inch / 12.0 for ft, inch in self.v_subs)
+
+    def area_sqft(self) -> float:
+        return self.h_feet_total() * self.v_feet_total() * self.factor
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "description": self.description,
+            "shape": self.shape,
+            "h_subs": [list(s) for s in self.h_subs],
+            "v_subs": [list(s) for s in self.v_subs],
+            "polygon_idx": self.polygon_idx,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "MeasurementRow":
+        row = cls(
+            description=d.get("description", ""),
+            shape=d.get("shape", SHAPE_RECT),
+            h_subs=d.get("h_subs"),
+            v_subs=d.get("v_subs"),
+            polygon_idx=d.get("polygon_idx"),
+        )
+        if isinstance(d.get("id"), int):
+            row.id = d["id"]
+            MeasurementRow._next_id = max(MeasurementRow._next_id, d["id"] + 1)
+        return row
+
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +269,8 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title(f"{APP_TITLE}  —  {APP_AUTHOR}, {APP_COMPANY}")
+        credit = f"{APP_AUTHOR}, {APP_COMPANY}" if APP_AUTHOR else APP_COMPANY
+        self.title(f"{APP_TITLE}  —  {credit}")
         self.geometry("1280x820")
         self.minsize(900, 600)
 
@@ -201,6 +295,9 @@ class App(tk.Tk):
         self.selected_vertex: Optional[int] = None
         self._dragging_vertex = False
         self._hover_edge: Optional[Tuple[int, int]] = None  # (poly_idx, edge_idx)
+
+        # v2.1: measurement sheet (arithmetic L x W breakdown)
+        self.measurement_rows: List["MeasurementRow"] = []
 
         # polygons: list of dicts {poly, color, name}
         self.polygons: List[dict] = []
@@ -264,6 +361,11 @@ class App(tk.Tk):
         ttk.Button(tb, text="Clear Current", command=self.clear_current).pack(side=tk.LEFT, padx=2)
         ttk.Button(tb, text="Delete Last Polygon", command=self.delete_last_polygon).pack(side=tk.LEFT, padx=2)
         ttk.Button(tb, text="Clear All Polygons", command=self.clear_all_polygons).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        # v2.1: measurement sheet actions
+        ttk.Button(tb, text="+ Row", command=self._add_measurement_row).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tb, text="Export xlsx", command=self._export_measurement_sheet_xlsx).pack(side=tk.LEFT, padx=2)
         ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
         ttk.Button(tb, text="Zoom +", command=lambda: self.zoom_by(self.ZOOM_STEP)).pack(side=tk.LEFT, padx=2)
@@ -357,12 +459,19 @@ class App(tk.Tk):
         self.calib_status = ttk.Label(cal, text="Not calibrated", foreground="#aa2222")
         self.calib_status.pack(anchor=tk.W, pady=(4, 0))
 
-        # ----- polygons list -----
-        plf = ttk.LabelFrame(side, text="Polygons", padding=8)
-        plf.pack(fill=tk.BOTH, expand=True, pady=4)
+        # ----- side-panel notebook: Polygons / Measurement Sheet -----
+        side_nb = ttk.Notebook(side)
+        side_nb.pack(fill=tk.BOTH, expand=True, pady=4)
+
+        # --- Polygons tab (was the old listbox) ---
+        plf = ttk.Frame(side_nb, padding=8)
+        side_nb.add(plf, text="Polygons")
         self.poly_list = tk.Listbox(plf, height=10, exportselection=False)
         self.poly_list.pack(fill=tk.BOTH, expand=True)
         self.poly_list.bind("<<ListboxSelect>>", self._on_poly_list_select)
+
+        # --- Measurement Sheet tab (v2.1) ---
+        self._build_measurement_sheet_tab(side_nb)
 
         # ----- legend / tips -----
         tips = ttk.LabelFrame(side, text="Tips", padding=8)
@@ -750,6 +859,348 @@ class App(tk.Tk):
         self._schedule_redraw()
 
     # ------------------------------------------------------------------
+    # v2.1: Measurement sheet (Treeview + Excel export)
+    # ------------------------------------------------------------------
+    # Columns we expose in the on-screen table.  Sub-segments (3 each) are
+    # shown as ft and in side-by-side, matching the user's existing CHFT
+    # Excel format: H = E + H + K + (F + I + L) / 12.
+    SHEET_COLS = (
+        "#", "Description", "Shape",
+        "H ft1", "H in1", "H ft2", "H in2", "H ft3", "H in3", "H total (ft)",
+        "V ft1", "V in1", "V ft2", "V in2", "V ft3", "V in3", "V total (ft)",
+        "Factor", "Area (sqft)", "Polygon", "Delta %",
+    )
+    SHEET_COL_WIDTHS = {
+        "#": 32, "Description": 140, "Shape": 70,
+        "H ft1": 38, "H in1": 38, "H ft2": 38, "H in2": 38, "H ft3": 38, "H in3": 38,
+        "H total (ft)": 70,
+        "V ft1": 38, "V in1": 38, "V ft2": 38, "V in2": 38, "V ft3": 38, "V in3": 38,
+        "V total (ft)": 70,
+        "Factor": 50, "Area (sqft)": 80,
+        "Polygon": 60, "Delta %": 60,
+    }
+
+    def _build_measurement_sheet_tab(self, notebook: ttk.Notebook) -> None:
+        frame = ttk.Frame(notebook, padding=4)
+        notebook.add(frame, text="Measurement Sheet")
+
+        hint = ttk.Label(
+            frame, justify=tk.LEFT,
+            text=("Arithmetic L x W breakdown of room areas, in feet + inches.\n"
+                  "Double-click any editable cell to change it.  Each row's H/V\n"
+                  "is the sum of three sub-segments, just like the CHFT Excel\n"
+                  "worksheet.  'Polygon' links the row to a traced polygon for\n"
+                  "automatic cross-check (delta %)."),
+        )
+        hint.pack(anchor=tk.W)
+
+        # Treeview
+        tree_wrap = ttk.Frame(frame)
+        tree_wrap.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        self.sheet_tree = ttk.Treeview(
+            tree_wrap, columns=self.SHEET_COLS, show="headings", height=10)
+        for c in self.SHEET_COLS:
+            self.sheet_tree.heading(c, text=c)
+            self.sheet_tree.column(c, width=self.SHEET_COL_WIDTHS.get(c, 60),
+                                   anchor=tk.CENTER, stretch=False)
+        ysb = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL,
+                            command=self.sheet_tree.yview)
+        xsb = ttk.Scrollbar(tree_wrap, orient=tk.HORIZONTAL,
+                            command=self.sheet_tree.xview)
+        self.sheet_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.sheet_tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        tree_wrap.rowconfigure(0, weight=1)
+        tree_wrap.columnconfigure(0, weight=1)
+        self.sheet_tree.bind("<Double-1>", self._on_sheet_double_click)
+
+        # Totals line + buttons
+        bottom = ttk.Frame(frame)
+        bottom.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(bottom, text="+ Row", command=self._add_measurement_row).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="Delete row", command=self._delete_measurement_row).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bottom, text="Export xlsx", command=self._export_measurement_sheet_xlsx).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="Clear sheet", command=self._clear_measurement_sheet).pack(side=tk.LEFT, padx=4)
+        self.sheet_total_label = ttk.Label(bottom, text="", font=("Segoe UI", 10, "bold"))
+        self.sheet_total_label.pack(side=tk.RIGHT)
+
+    def _refresh_measurement_sheet(self) -> None:
+        if not hasattr(self, "sheet_tree"):
+            return
+        for iid in self.sheet_tree.get_children():
+            self.sheet_tree.delete(iid)
+        total_sqft = 0.0
+        for idx, row in enumerate(self.measurement_rows, start=1):
+            h_tot = row.h_feet_total()
+            v_tot = row.v_feet_total()
+            area = row.area_sqft()
+            total_sqft += area
+            poly_label = ""
+            delta_pct = ""
+            if row.polygon_idx is not None and 0 <= row.polygon_idx < len(self.polygons):
+                poly = self.polygons[row.polygon_idx]
+                poly_area_px2 = polygon_area_image_pts(poly["poly"])
+                m2, _ = self.calib.area_real(poly_area_px2)
+                poly_sqft = m2 * 10.7639
+                poly_label = f"#{row.polygon_idx + 1}"
+                if area > 1e-6:
+                    delta_pct = f"{(poly_sqft - area) / area * 100:+.2f}%"
+                else:
+                    delta_pct = "\u2014"
+            values = [
+                idx, row.description, row.shape,
+                row.h_subs[0][0], row.h_subs[0][1],
+                row.h_subs[1][0], row.h_subs[1][1],
+                row.h_subs[2][0], row.h_subs[2][1],
+                f"{h_tot:.3f}",
+                row.v_subs[0][0], row.v_subs[0][1],
+                row.v_subs[1][0], row.v_subs[1][1],
+                row.v_subs[2][0], row.v_subs[2][1],
+                f"{v_tot:.3f}",
+                f"{row.factor:g}", f"{area:,.3f}",
+                poly_label, delta_pct,
+            ]
+            self.sheet_tree.insert("", tk.END, iid=str(row.id), values=values)
+        total_m2 = total_sqft / 10.7639
+        self.sheet_total_label.config(
+            text=f"Total: {total_sqft:,.2f} sqft  /  {total_m2:,.2f} m\u00b2")
+
+    def _add_measurement_row(self) -> None:
+        link = (len(self.polygons) - 1) if len(self.polygons) == 1 else None
+        row = MeasurementRow(polygon_idx=link)
+        self.measurement_rows.append(row)
+        self._refresh_measurement_sheet()
+
+    def _delete_measurement_row(self) -> None:
+        sel = self.sheet_tree.selection() if hasattr(self, "sheet_tree") else ()
+        if not sel:
+            messagebox.showinfo("Delete row", "Select a row in the measurement sheet first.")
+            return
+        del_id = int(sel[0])
+        self.measurement_rows = [r for r in self.measurement_rows if r.id != del_id]
+        self._refresh_measurement_sheet()
+
+    def _clear_measurement_sheet(self) -> None:
+        if not self.measurement_rows:
+            return
+        if not messagebox.askyesno("Clear sheet", "Delete every measurement row?"):
+            return
+        self.measurement_rows.clear()
+        self._refresh_measurement_sheet()
+
+    def _on_sheet_double_click(self, event) -> None:
+        region = self.sheet_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        row_id = self.sheet_tree.identify_row(event.y)
+        col_id = self.sheet_tree.identify_column(event.x)
+        if not row_id or not col_id:
+            return
+        row = next((r for r in self.measurement_rows if str(r.id) == row_id), None)
+        if row is None:
+            return
+        col_idx = int(col_id.lstrip("#")) - 1
+        col_name = self.SHEET_COLS[col_idx]
+        self._edit_sheet_cell(row, col_name)
+
+    def _edit_sheet_cell(self, row, col_name: str) -> None:
+        if col_name == "Description":
+            new = simpledialog.askstring("Description", "Description:", initialvalue=row.description, parent=self)
+            if new is not None:
+                row.description = new
+        elif col_name == "Shape":
+            new = simpledialog.askstring(
+                "Shape", "Shape (rectangle / triangle):",
+                initialvalue=row.shape, parent=self)
+            if new and new in SHAPE_FACTORS:
+                row.shape = new
+                row.factor = SHAPE_FACTORS[new]
+        elif col_name.startswith("H ft"):
+            i = int(col_name.split()[2]) - 1
+            ft, inch = row.h_subs[i]
+            new = simpledialog.askfloat("H feet", f"H sub {i+1} - feet:", initialvalue=ft, parent=self, minvalue=0)
+            if new is not None:
+                row.h_subs[i] = (new, inch)
+        elif col_name.startswith("H in"):
+            i = int(col_name.split()[2]) - 1
+            ft, inch = row.h_subs[i]
+            new = simpledialog.askfloat("H inches", f"H sub {i+1} - inches:", initialvalue=inch, parent=self, minvalue=0)
+            if new is not None:
+                row.h_subs[i] = (ft, new)
+        elif col_name.startswith("V ft"):
+            i = int(col_name.split()[2]) - 1
+            ft, inch = row.v_subs[i]
+            new = simpledialog.askfloat("V feet", f"V sub {i+1} - feet:", initialvalue=ft, parent=self, minvalue=0)
+            if new is not None:
+                row.v_subs[i] = (new, inch)
+        elif col_name.startswith("V in"):
+            i = int(col_name.split()[2]) - 1
+            ft, inch = row.v_subs[i]
+            new = simpledialog.askfloat("V inches", f"V sub {i+1} - inches:", initialvalue=inch, parent=self, minvalue=0)
+            if new is not None:
+                row.v_subs[i] = (ft, new)
+        elif col_name == "Polygon":
+            current = "" if row.polygon_idx is None else str(row.polygon_idx + 1)
+            new = simpledialog.askstring(
+                "Polygon link",
+                f"Link to polygon number (1..{len(self.polygons)}) or blank to unlink:",
+                initialvalue=current, parent=self)
+            if new is None:
+                return
+            new = new.strip()
+            if not new:
+                row.polygon_idx = None
+            else:
+                try:
+                    n = int(new)
+                    if 1 <= n <= len(self.polygons):
+                        row.polygon_idx = n - 1
+                    else:
+                        messagebox.showerror("Polygon link", f"Polygon must be 1..{len(self.polygons)}")
+                except ValueError:
+                    messagebox.showerror("Polygon link", "Enter a number, or leave blank.")
+        else:
+            return
+        self._refresh_measurement_sheet()
+
+    def _export_measurement_sheet_xlsx(self) -> None:
+        if not self.measurement_rows:
+            messagebox.showinfo("Export", "The measurement sheet is empty.")
+            return
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        except ImportError:
+            messagebox.showerror(
+                "Export",
+                "openpyxl is required for .xlsx export.\n\nInstall it with:\n  pip install openpyxl")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export measurement sheet",
+            defaultextension=".xlsx",
+            filetypes=[("Excel workbook", "*.xlsx")],
+            initialfile=(os.path.splitext(os.path.basename(self.image_path or "plan"))[0] or "plan") + "-measurements.xlsx",
+        )
+        if not path:
+            return
+        wb = openpyxl.Workbook()
+        bold = Font(bold=True)
+        header_fill = PatternFill("solid", fgColor="DDDDDD")
+        thin = Side(border_style="thin", color="999999")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        # Sheet 1: Measurement rows
+        ws = wb.active
+        ws.title = "Measurements"
+        headers = [
+            "#", "Description", "Shape",
+            "H ft1", "H in1", "H ft2", "H in2", "H ft3", "H in3", "H total (ft)",
+            "V ft1", "V in1", "V ft2", "V in2", "V ft3", "V in3", "V total (ft)",
+            "Factor", "Area (sqft)", "Area (m\u00b2)", "Polygon", "Delta %",
+        ]
+        for col, h in enumerate(headers, start=1):
+            c = ws.cell(row=1, column=col, value=h)
+            c.font = bold
+            c.fill = header_fill
+            c.alignment = Alignment(horizontal="center")
+            c.border = border
+        total_sqft = 0.0
+        for i, row in enumerate(self.measurement_rows, start=1):
+            h_tot = row.h_feet_total()
+            v_tot = row.v_feet_total()
+            area_sqft = row.area_sqft()
+            area_m2 = area_sqft / 10.7639
+            total_sqft += area_sqft
+            poly_label = ""
+            delta_pct = ""
+            if row.polygon_idx is not None and 0 <= row.polygon_idx < len(self.polygons):
+                poly = self.polygons[row.polygon_idx]
+                poly_area_px2 = polygon_area_image_pts(poly["poly"])
+                m2, _ = self.calib.area_real(poly_area_px2)
+                poly_sqft = m2 * 10.7639
+                poly_label = f"#{row.polygon_idx + 1}"
+                if area_sqft > 1e-6:
+                    delta_pct = f"{(poly_sqft - area_sqft) / area_sqft * 100:+.2f}%"
+                else:
+                    delta_pct = "\u2014"
+            values = [
+                i, row.description, row.shape,
+                row.h_subs[0][0], row.h_subs[0][1],
+                row.h_subs[1][0], row.h_subs[1][1],
+                row.h_subs[2][0], row.h_subs[2][1],
+                h_tot,
+                row.v_subs[0][0], row.v_subs[0][1],
+                row.v_subs[1][0], row.v_subs[1][1],
+                row.v_subs[2][0], row.v_subs[2][1],
+                v_tot,
+                row.factor, area_sqft, area_m2,
+                poly_label, delta_pct,
+            ]
+            for col, v in enumerate(values, start=1):
+                c = ws.cell(row=i + 1, column=col, value=v)
+                c.border = border
+        total_row = len(self.measurement_rows) + 2
+        c = ws.cell(row=total_row, column=1, value="Total")
+        c.font = bold
+        c = ws.cell(row=total_row, column=19, value=total_sqft)
+        c.font = bold
+        c.number_format = "#,##0.00"
+        c = ws.cell(row=total_row, column=20, value=total_sqft / 10.7639)
+        c.font = bold
+        c.number_format = "#,##0.00"
+        widths = [4, 30, 10, 6, 6, 6, 6, 6, 6, 10, 6, 6, 6, 6, 6, 6, 10, 6, 12, 12, 8, 9]
+        for i, w in enumerate(widths, start=1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+        # Sheet 2: Polygons
+        wp = wb.create_sheet("Polygons")
+        wp.append(["#", "Name", "Colour", "Area (px\u00b2)", "Area (m\u00b2)", "Area (sqft)"])
+        for col, _ in enumerate(wp[1], start=1):
+            wp[1][col - 1].font = bold
+            wp[1][col - 1].fill = header_fill
+        for i, p in enumerate(self.polygons, start=1):
+            px2 = polygon_area_image_pts(p["poly"])
+            m2, _ = self.calib.area_real(px2)
+            wp.append([i, p["name"], p["color"], int(px2), m2, m2 * 10.7639])
+        for i, w in enumerate([4, 30, 10, 14, 12, 12], start=1):
+            wp.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+        # Sheet 3: Calibration
+        wc = wb.create_sheet("Calibration")
+        c = self.calib
+        wc.append(["Field", "Value"])
+        wc["A1"].font = bold; wc["B1"].font = bold
+        wc["A1"].fill = header_fill; wc["B1"].fill = header_fill
+        wc.append(["V point 1 (px)", c.p1])
+        wc.append(["V point 2 (px)", c.p2])
+        wc.append(["V real distance", c.v_real])
+        wc.append(["H point 1 (px)", c.p3])
+        wc.append(["H point 2 (px)", c.p4])
+        wc.append(["H real distance", c.h_real])
+        wc.append(["Real unit", c.unit])
+        wc.append(["Calibrated", "yes" if c.ready else "no"])
+        for i, w in enumerate([20, 18], start=1):
+            wc.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+        # Sheet 4: Summary (first tab)
+        wsum = wb.create_sheet("Summary", 0)
+        wsum.append(["Floor / Plan", os.path.basename(self.image_path or "(no image)")])
+        wsum.append(["Generated by", APP_TITLE + "  \u2014  " + (APP_AUTHOR + ", " if APP_AUTHOR else "") + APP_COMPANY])
+        wsum.append(["Version", __version__])
+        wsum.append(["Total rows", len(self.measurement_rows)])
+        wsum.append(["Total area (sqft)", total_sqft])
+        wsum.append(["Total area (m\u00b2)", total_sqft / 10.7639])
+        for i, w in enumerate([24, 40], start=1):
+            wsum.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+        try:
+            wb.save(path)
+            self.status.set(f"Exported measurement sheet to {path}")
+        except Exception as e:
+            messagebox.showerror("Export", f"Failed to write {path}:\n{e}")
+
+    # ------------------------------------------------------------------
     # Mode change
     # ------------------------------------------------------------------
     def _on_mode_change(self) -> None:
@@ -1051,6 +1502,7 @@ class App(tk.Tk):
                 {"poly": p["poly"], "color": p["color"], "name": p["name"]}
                 for p in self.polygons
             ],
+            "measurement_rows": [r.to_dict() for r in self.measurement_rows],
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -1078,6 +1530,9 @@ class App(tk.Tk):
         for p in self.polygons:
             self.poly_list.insert(tk.END, p.get("name", "?"))
         self.current_poly.clear()
+        # Restore measurement rows (v2.1).  Missing key -> empty list.
+        self.measurement_rows = [MeasurementRow.from_dict(d) for d in data.get("measurement_rows", [])]
+        self._refresh_measurement_sheet()
         self._refresh_calib_entries()
         self.fit_to_window()
         self._update_status()

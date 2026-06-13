@@ -82,12 +82,19 @@ git push origin v1.0.0
 | Pan | middle-drag, or hold **Space** + drag |
 | Toggle units | toolbar ▸ *Units* dropdown |
 
+## What's new in v2.1
+
+- **Measurement Sheet tab** — a spreadsheet-style view alongside the Polygons tab. Each row is a (sub-)rectangle or (sub-)triangle of a room, with three sub-segment H and V inputs (feet + inches) that sum to a total L x W, exactly like the CHFT Excel worksheet.
+- **Live area + cross-check** — every row shows its arithmetic area in sqft, and if you link the row to a traced polygon, the delta vs. the polygon area is shown as a percentage.
+- **One-click Excel export** — toolbar `Export xlsx` button writes a 4-sheet workbook: `Summary`, `Measurements` (the row table), `Polygons` (raw traced areas), and `Calibration` (so the workbook is self-contained).
+- **Branding** — title bar now reads `Floor Plan Area Meter — CHFT` (no personal name).
+- Version bumped to `2.1.0-measurement`.
+
 ## What's new in v2.0
 
 - **Draggable polygon vertices** — switch to **Edit** mode, click a vertex to select it, drag to move. Live area updates as you drag.
 - **Insert / delete vertices** — in Edit mode, double-click an edge to insert a new vertex; right-click a vertex to delete it (rooms keep >= 3 vertices).
 - **Draw / Pan mode toggle** — Adobe-style: when Pan mode is on, left-drag pans the canvas (no more accidentally placing a vertex when you meant to pan). Middle-drag, Space+drag, and arrow keys still pan regardless of mode.
-- **Author credit in the UI** — title bar and Help → About both show "Bobby Mak, CHFT Surveyors".
 - Version bumped to `2.0.0`.
 
 ## Calibration 101

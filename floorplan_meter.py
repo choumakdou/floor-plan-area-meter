@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Build metadata — stamped by the GitHub Actions workflow on every build.
 # When running from source these fall back to the dev defaults below.
 # --- build metadata ---
-__version__ = "2.2.0-rotation-rect"
+__version__ = "2.2.1-rect-mode"
 __build__ = "local"
 __built_at__ = ""
 
@@ -287,9 +287,13 @@ class App(tk.Tk):
         # and measurement rows stay in unrotated image-pixel space; the
         # rotation is applied as a pre-render transform on the image only.
         self.rotation_deg: float = 0.0
+        # v2.2.1: rectangle drag state
+        self._dragging_rect: bool = False
+        self._rect_drag_start: Optional[Point] = None
+        self._rect_drag_current: Optional[Point] = None
 
         self.calib = Calibration()
-        self.mode = tk.StringVar(value="polygon")     # 'polygon' | 'calibV' | 'calibH' | 'edit'
+        self.mode = tk.StringVar(value="polygon")     # 'polygon' | 'rectangle' | 'calibV' | 'calibH' | 'edit'
         self.input_mode = tk.StringVar(value="draw")  # 'draw' | 'pan'  (interaction mode)
         self.unit_var = tk.StringVar(value="m²")
         self.show_labels = tk.BooleanVar(value=True)
@@ -330,6 +334,8 @@ class App(tk.Tk):
         ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
         ttk.Label(tb, text="Mode:").pack(side=tk.LEFT)
+        ttk.Radiobutton(tb, text="Rectangle", variable=self.mode,
+                        value="rectangle", command=self._on_mode_change).pack(side=tk.LEFT)
         ttk.Radiobutton(tb, text="Polygon", variable=self.mode,
                         value="polygon", command=self._on_mode_change).pack(side=tk.LEFT)
         ttk.Radiobutton(tb, text="Edit", variable=self.mode,
@@ -806,13 +812,27 @@ class App(tk.Tk):
                 if 0 <= pi < self.poly_list.size():
                     self.poly_list.selection_clear(0, tk.END)
                     self.poly_list.selection_set(pi)
-        else:  # polygon
+        elif mode == "rectangle":
+            # v2.2.1: rectangle drag mode.  Start a drag; on_left_release
+            # will commit the 4-vertex polygon.
+            self._rect_drag_start = (ix, iy)
+            self._rect_drag_current = (ix, iy)
+            self._dragging_rect = True
+        else:  # polygon (free-form)
             self.current_poly.append((ix, iy))
         self._schedule_redraw()
 
     def on_left_release(self, event):
         self._dragging_vertex = False
         self._panning = False
+        # v2.2.1: commit a rectangle drag if one is in progress
+        if self._dragging_rect and self.mode.get() == "rectangle" \
+                and self._rect_drag_start is not None and self._rect_drag_current is not None:
+            self._commit_rectangle(self._rect_drag_start, self._rect_drag_current)
+            self._dragging_rect = False
+            self._rect_drag_start = None
+            self._rect_drag_current = None
+            self._schedule_redraw()
 
     def on_double_click(self, event):
         if self.image is None or self.mode.get() != "edit":
@@ -828,6 +848,71 @@ class App(tk.Tk):
         self.selected_polygon = pi
         self.selected_vertex = new_vi
         self._schedule_redraw()
+
+    def _commit_rectangle(self, p1: Point, p2: Point) -> None:
+        """Create a 4-vertex polygon (axis-aligned rectangle from p1 to p2)
+        and auto-populate a measurement row from the rectangle's pixel
+        dimensions / calibration ratio.  Ignored if the rectangle is
+        degenerate (< 3 px in either dimension)."""
+        x1, y1 = p1
+        x2, y2 = p2
+        if abs(x2 - x1) < 3 or abs(y2 - y1) < 3:
+            return
+        rect = [
+            (min(x1, x2), min(y1, y2)),  # top-left
+            (max(x1, x2), min(y1, y2)),  # top-right
+            (max(x1, x2), max(y1, y2)),  # bottom-right
+            (min(x1, x2), max(y1, y2)),  # bottom-left
+        ]
+        color = random.choice(self.COLOURS)
+        name = f"Room {len(self.polygons) + 1}"
+        self.polygons.append({"poly": rect, "color": color, "name": name})
+        self.poly_list.insert(tk.END, name)
+        # Auto-populate a measurement row from the rectangle.
+        w_px = max(x1, x2) - min(x1, x2)
+        h_px = max(y1, y2) - min(y1, y2)
+        self._auto_row_for_polygon(w_px, h_px, polygon_idx=len(self.polygons) - 1)
+        self._refresh_measurement_sheet()
+
+    def _auto_row_for_polygon(self, w_px: float, h_px: float, polygon_idx: int) -> None:
+        """Create a measurement row pre-filled with the rectangle's H/V
+        in real units (uses the calibration's real_per_px_h/_v).  Units
+        match the calibration: m or ft.  If not calibrated, leaves the
+        row with zeros (user fills in manually)."""
+        if not self.calib.ready:
+            return
+        h_real = self.calib.real_per_px_h() * w_px
+        v_real = self.calib.real_per_px_v() * h_px
+        # Convert to (feet, inches) if the calibration is in feet, else
+        # just use metres with a decimal.
+        if self.calib.unit == "ft":
+            from math import modf
+            def _to_ft_in(real_ft):
+                # Convert e.g. 8.988 to (8, 11.86) not (8, 11.99 then
+                # rollover to 9 ft 0 in).  We keep full float precision
+                # and let the user adjust in the row editor.
+                ft_i = int(real_ft) if real_ft >= 0 else 0
+                inches = round((real_ft - ft_i) * 12, 2)
+                # Promote if the rounding just barely produced 12 in
+                if inches >= 11.995:
+                    ft_i += 1
+                    inches = 0.0
+                return (float(ft_i), float(inches))
+            h_ft_i, h_in = _to_ft_in(h_real)
+            v_ft_i, v_in = _to_ft_in(v_real)
+            h_subs = [(h_ft_i, h_in), (0.0, 0.0), (0.0, 0.0)]
+            v_subs = [(v_ft_i, v_in), (0.0, 0.0), (0.0, 0.0)]
+        else:  # metres
+            h_subs = [(round(h_real, 3), 0.0), (0.0, 0.0), (0.0, 0.0)]
+            v_subs = [(round(v_real, 3), 0.0), (0.0, 0.0), (0.0, 0.0)]
+        row = MeasurementRow(
+            description="Room " + str(polygon_idx + 1),
+            shape=SHAPE_RECT,
+            h_subs=h_subs,
+            v_subs=v_subs,
+            polygon_idx=polygon_idx,
+        )
+        self.measurement_rows.append(row)
 
     def on_right_click(self, event):
         if self.mode.get() == "edit" and self.selected_polygon is not None and self.selected_vertex is not None:
@@ -861,6 +946,13 @@ class App(tk.Tk):
             if 0 <= self.selected_vertex < len(poly):
                 poly[self.selected_vertex] = (ix, iy)
                 self._schedule_redraw()
+            return
+
+        # Live rectangle drag in rectangle mode
+        if self._dragging_rect and self.mode.get() == "rectangle" \
+                and self._rect_drag_start is not None:
+            self._rect_drag_current = (self._hover_point[0], self._hover_point[1])
+            self._schedule_redraw()
             return
 
         # Edge hover (for insert-vertex hint)
@@ -1497,7 +1589,14 @@ class App(tk.Tk):
         drw = ImageDraw.Draw(overlay, "RGBA")
 
         def to_canvas_poly(poly: Polygon):
-            return [(p[0] * self.zoom, p[1] * self.zoom) for p in poly]
+            # Polygon vertices are in unrotated image-pixel space.  Apply
+            # the rotor (so the polygon lines up with the rotated image),
+            # then scale by zoom.  The Tk pan offset is applied later,
+            # when the rendered composite is placed on the canvas.
+            return [to_canvas_xy(p[0], p[1]) for p in poly]
+        def to_canvas_xy(x, y):
+            rx, ry = self._rotor(x, y)
+            return (rx * self.zoom, ry * self.zoom)
 
         # filled polygons (50% transparent) + outlines
         for p in self.polygons:
@@ -1512,13 +1611,42 @@ class App(tk.Tk):
             for x, y in pts:
                 drw.ellipse((x - 4, y - 4, x + 4, y + 4), fill="#ffffff")
             if self._hover_point:
-                hx, hy = self._hover_point[0] * self.zoom, self._hover_point[1] * self.zoom
+                hx, hy = to_canvas_xy(self._hover_point[0], self._hover_point[1])
                 pts2 = pts + [(hx, hy)]
                 if len(pts2) >= 2:
                     drw.line(pts2, fill="#ffffff", width=1)
             if len(pts) >= 3:
                 # preview filled
                 drw.polygon(pts, fill="#ffffff40", outline="#ffffff")
+
+        # in-progress rectangle drag (v2.2.1)
+        if self._dragging_rect and self._rect_drag_start is not None \
+                and self._rect_drag_current is not None and self.mode.get() == "rectangle":
+            x1, y1 = self._rect_drag_start
+            x2, y2 = self._rect_drag_current
+            if abs(x2 - x1) >= 3 and abs(y2 - y1) >= 3:
+                rect_pts = [
+                    to_canvas_xy(min(x1, x2), min(y1, y2)),
+                    to_canvas_xy(max(x1, x2), min(y1, y2)),
+                    to_canvas_xy(max(x1, x2), max(y1, y2)),
+                    to_canvas_xy(min(x1, x2), max(y1, y2)),
+                ]
+                drw.polygon(rect_pts, fill="#ffffff40", outline="#ffff00")
+                # Live size label at the centre
+                w_px = abs(x2 - x1)
+                h_px = abs(y2 - y1)
+                centre = (
+                    (rect_pts[0][0] + rect_pts[2][0]) / 2,
+                    (rect_pts[0][1] + rect_pts[2][1]) / 2,
+                )
+                if self.calib.ready:
+                    h_real = self.calib.real_per_px_h() * w_px
+                    v_real = self.calib.real_per_px_v() * h_px
+                    label = f"{h_real:.2f} x {v_real:.2f} {self.calib.unit}\n{w_px:.0f} x {h_px:.0f} px"
+                else:
+                    label = f"{w_px:.0f} x {h_px:.0f} px"
+                drw.text(centre, label, fill="white", anchor="mm",
+                         stroke_width=2, stroke_fill="black")
 
         composite = Image.alpha_composite(scaled, overlay)
         self._display_image = composite

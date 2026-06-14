@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Build metadata — stamped by the GitHub Actions workflow on every build.
 # When running from source these fall back to the dev defaults below.
 # --- build metadata ---
-__version__ = "2.2.1-rect-mode"
+__version__ = "2.3.0-snap"
 __build__ = "local"
 __built_at__ = ""
 
@@ -291,6 +291,14 @@ class App(tk.Tk):
         self._dragging_rect: bool = False
         self._rect_drag_start: Optional[Point] = None
         self._rect_drag_current: Optional[Point] = None
+        # v2.3: snap state
+        # _snap_target stores the snap-applied point so we can draw a
+        # visual marker on the canvas.  _snap_excluded_indices is the
+        # list of polygon indices to skip when looking for snap targets
+        # (e.g. the polygon being edited, or the rectangle being drawn).
+        self._snap_target: Optional[Point] = None
+        self._snap_kind: str = ""            # 'vertex' | 'edge' | ''
+        self.SNAP_TOL_PX: float = 8.0        # image-pixel radius
 
         self.calib = Calibration()
         self.mode = tk.StringVar(value="polygon")     # 'polygon' | 'rectangle' | 'calibV' | 'calibH' | 'edit'
@@ -825,6 +833,9 @@ class App(tk.Tk):
     def on_left_release(self, event):
         self._dragging_vertex = False
         self._panning = False
+        # v2.3: clear snap state on release
+        self._snap_target = None
+        self._snap_kind = ""
         # v2.2.1: commit a rectangle drag if one is in progress
         if self._dragging_rect and self.mode.get() == "rectangle" \
                 and self._rect_drag_start is not None and self._rect_drag_current is not None:
@@ -944,14 +955,36 @@ class App(tk.Tk):
             ix, iy = self.canvas_to_image(event.x, event.y)
             poly = self.polygons[self.selected_polygon]["poly"]
             if 0 <= self.selected_vertex < len(poly):
-                poly[self.selected_vertex] = (ix, iy)
+                # v2.3: snap the dragged vertex to nearby vertex/edge
+                # of OTHER polygons (skip the polygon being edited).
+                snap = self._find_snap_target(ix, iy,
+                                              exclude_poly_idx=self.selected_polygon)
+                if snap is not None:
+                    self._snap_target = snap[0]
+                    self._snap_kind = snap[1]
+                    poly[self.selected_vertex] = snap[0]
+                else:
+                    self._snap_target = None
+                    self._snap_kind = ""
+                    poly[self.selected_vertex] = (ix, iy)
                 self._schedule_redraw()
             return
 
         # Live rectangle drag in rectangle mode
         if self._dragging_rect and self.mode.get() == "rectangle" \
                 and self._rect_drag_start is not None:
+            # v2.3: try to snap the current corner to a nearby vertex
+            # or edge of an existing polygon.
             self._rect_drag_current = (self._hover_point[0], self._hover_point[1])
+            snap = self._find_snap_target(self._rect_drag_current[0],
+                                          self._rect_drag_current[1])
+            if snap is not None:
+                self._rect_drag_current = snap[0]
+                self._snap_target = snap[0]
+                self._snap_kind = snap[1]
+            else:
+                self._snap_target = None
+                self._snap_kind = ""
             self._schedule_redraw()
             return
 
@@ -1513,6 +1546,8 @@ class App(tk.Tk):
         self.current_poly.clear()
         self.selected_polygon = None
         self.selected_vertex = None
+        self._snap_target = None
+        self._snap_kind = ""
         self._schedule_redraw()
 
     def _on_input_mode_change(self) -> None:
@@ -1648,6 +1683,17 @@ class App(tk.Tk):
                 drw.text(centre, label, fill="white", anchor="mm",
                          stroke_width=2, stroke_fill="black")
 
+        # v2.3: snap marker (drawn on top, in the PIL overlay)
+        if self._snap_target is not None:
+            sx, sy = to_canvas_xy(*self._snap_target)
+            r = 6
+            drw.ellipse((sx - r, sy - r, sx + r, sy + r),
+                        outline="#ff00ff", width=2)
+            # Cross-hair lines extending a bit beyond
+            cross = 12
+            drw.line((sx - cross, sy, sx + cross, sy), fill="#ff00ff", width=1)
+            drw.line((sx, sy - cross, sx, sy + cross), fill="#ff00ff", width=1)
+
         composite = Image.alpha_composite(scaled, overlay)
         self._display_image = composite
 
@@ -1728,6 +1774,54 @@ class App(tk.Tk):
                     best_d = d
         return best
 
+    def _find_snap_target(self, ix: float, iy: float,
+                          exclude_poly_idx: int = -1) -> Optional[Tuple[Point, str]]:
+        """Return (snapped_point, kind) if a snap target exists within
+        SNAP_TOL_PX image pixels, else None.  Vertex-to-vertex takes
+        precedence over edge-to-vertex (the latter is the perpendicular
+        projection onto the nearest edge).
+
+        Used by v2.3 in rectangle drag and edit-mode vertex drag.
+        """
+        # 1. Vertex-to-vertex
+        best_v_d2 = self.SNAP_TOL_PX * self.SNAP_TOL_PX
+        best_v_pt: Optional[Point] = None
+        for pi, p in enumerate(self.polygons):
+            if pi == exclude_poly_idx:
+                continue
+            for vx, vy in p["poly"]:
+                d2 = (vx - ix) ** 2 + (vy - iy) ** 2
+                if d2 <= best_v_d2:
+                    best_v_d2 = d2
+                    best_v_pt = (vx, vy)
+        if best_v_pt is not None:
+            return (best_v_pt, "vertex")
+        # 2. Edge-to-vertex (perpendicular projection)
+        best_e_d = self.SNAP_TOL_PX
+        best_e_pt: Optional[Point] = None
+        for pi, p in enumerate(self.polygons):
+            if pi == exclude_poly_idx:
+                continue
+            poly = p["poly"]
+            n = len(poly)
+            for vi in range(n):
+                ax, ay = poly[vi]
+                bx, by = poly[(vi + 1) % n]
+                dx, dy = bx - ax, by - ay
+                L2 = dx * dx + dy * dy
+                if L2 == 0:
+                    continue
+                t = ((ix - ax) * dx + (iy - ay) * dy) / L2
+                t = max(0.0, min(1.0, t))
+                qx, qy = ax + t * dx, ay + t * dy
+                d = math.hypot(ix - qx, iy - qy)
+                if d <= best_e_d:
+                    best_e_d = d
+                    best_e_pt = (qx, qy)
+        if best_e_pt is not None:
+            return (best_e_pt, "edge")
+        return None
+
     def _draw_edit_handles(self) -> None:
         for pi, p in enumerate(self.polygons):
             is_selected = (pi == self.selected_polygon)
@@ -1755,6 +1849,17 @@ class App(tk.Tk):
                 r = 4
                 self.canvas.create_oval(cmx - r, cmy - r, cmx + r, cmy + r,
                                         fill="yellow", outline="black", width=1)
+
+        # v2.3: snap marker on the Tk canvas too (so it shows in edit mode
+        # where the in-progress vertex is drawn on the Tk canvas, not the PIL overlay)
+        if self._snap_target is not None and self.mode.get() == "edit":
+            sx, sy = self.image_to_canvas(*self._snap_target)
+            r = 7
+            self.canvas.create_oval(sx - r, sy - r, sx + r, sy + r,
+                                    outline="#ff00ff", width=2)
+            cross = 12
+            self.canvas.create_line(sx - cross, sy, sx + cross, sy, fill="#ff00ff", width=1)
+            self.canvas.create_line(sx, sy - cross, sx, sy + cross, fill="#ff00ff", width=1)
 
     def _draw_calib(self) -> None:
         c = self.calib

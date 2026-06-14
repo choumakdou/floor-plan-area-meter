@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Build metadata — stamped by the GitHub Actions workflow on every build.
 # When running from source these fall back to the dev defaults below.
 # --- build metadata ---
-__version__ = "2.1.0-measurement"
+__version__ = "2.1.1-row-editor"
 __build__ = "local"
 __built_at__ = ""
 
@@ -919,6 +919,7 @@ class App(tk.Tk):
         bottom = ttk.Frame(frame)
         bottom.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(bottom, text="+ Row", command=self._add_measurement_row).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="Edit row", command=self._edit_selected_measurement_row).pack(side=tk.LEFT, padx=4)
         ttk.Button(bottom, text="Delete row", command=self._delete_measurement_row).pack(side=tk.LEFT, padx=4)
         ttk.Button(bottom, text="Export xlsx", command=self._export_measurement_sheet_xlsx).pack(side=tk.LEFT)
         ttk.Button(bottom, text="Clear sheet", command=self._clear_measurement_sheet).pack(side=tk.LEFT, padx=4)
@@ -981,6 +982,16 @@ class App(tk.Tk):
         self.measurement_rows = [r for r in self.measurement_rows if r.id != del_id]
         self._refresh_measurement_sheet()
 
+    def _edit_selected_measurement_row(self) -> None:
+        sel = self.sheet_tree.selection() if hasattr(self, "sheet_tree") else ()
+        if not sel:
+            messagebox.showinfo("Edit row", "Select a row in the measurement sheet first.")
+            return
+        row_id = int(sel[0])
+        row = next((r for r in self.measurement_rows if r.id == row_id), None)
+        if row is not None:
+            self._open_row_editor(row)
+
     def _clear_measurement_sheet(self) -> None:
         if not self.measurement_rows:
             return
@@ -990,79 +1001,163 @@ class App(tk.Tk):
         self._refresh_measurement_sheet()
 
     def _on_sheet_double_click(self, event) -> None:
+        """Open the row editor for the double-clicked row.
+
+        v2.1.1: a single form-based editor replaces v2.1's per-cell
+        simpledialog.askfloat, which had two bugs:
+          1. "H ft1".split()[2] raised IndexError (only 2 tokens, not 3),
+             silently swallowed, so the dialog never appeared.
+          2. askfloat on Windows silently returns None for value=0.0.
+        The new editor opens a Toplevel with all 12 sub-segment inputs at
+        once, plus a live area preview, plus a Save button.
+        """
         region = self.sheet_tree.identify("region", event.x, event.y)
         if region != "cell":
             return
         row_id = self.sheet_tree.identify_row(event.y)
-        col_id = self.sheet_tree.identify_column(event.x)
-        if not row_id or not col_id:
+        if not row_id:
             return
         row = next((r for r in self.measurement_rows if str(r.id) == row_id), None)
         if row is None:
             return
-        col_idx = int(col_id.lstrip("#")) - 1
-        col_name = self.SHEET_COLS[col_idx]
-        self._edit_sheet_cell(row, col_name)
+        self._open_row_editor(row)
 
-    def _edit_sheet_cell(self, row, col_name: str) -> None:
-        if col_name == "Description":
-            new = simpledialog.askstring("Description", "Description:", initialvalue=row.description, parent=self)
-            if new is not None:
-                row.description = new
-        elif col_name == "Shape":
-            new = simpledialog.askstring(
-                "Shape", "Shape (rectangle / triangle):",
-                initialvalue=row.shape, parent=self)
-            if new and new in SHAPE_FACTORS:
-                row.shape = new
-                row.factor = SHAPE_FACTORS[new]
-        elif col_name.startswith("H ft"):
-            i = int(col_name.split()[2]) - 1
-            ft, inch = row.h_subs[i]
-            new = simpledialog.askfloat("H feet", f"H sub {i+1} - feet:", initialvalue=ft, parent=self, minvalue=0)
-            if new is not None:
-                row.h_subs[i] = (new, inch)
-        elif col_name.startswith("H in"):
-            i = int(col_name.split()[2]) - 1
-            ft, inch = row.h_subs[i]
-            new = simpledialog.askfloat("H inches", f"H sub {i+1} - inches:", initialvalue=inch, parent=self, minvalue=0)
-            if new is not None:
-                row.h_subs[i] = (ft, new)
-        elif col_name.startswith("V ft"):
-            i = int(col_name.split()[2]) - 1
-            ft, inch = row.v_subs[i]
-            new = simpledialog.askfloat("V feet", f"V sub {i+1} - feet:", initialvalue=ft, parent=self, minvalue=0)
-            if new is not None:
-                row.v_subs[i] = (new, inch)
-        elif col_name.startswith("V in"):
-            i = int(col_name.split()[2]) - 1
-            ft, inch = row.v_subs[i]
-            new = simpledialog.askfloat("V inches", f"V sub {i+1} - inches:", initialvalue=inch, parent=self, minvalue=0)
-            if new is not None:
-                row.v_subs[i] = (ft, new)
-        elif col_name == "Polygon":
-            current = "" if row.polygon_idx is None else str(row.polygon_idx + 1)
-            new = simpledialog.askstring(
-                "Polygon link",
-                f"Link to polygon number (1..{len(self.polygons)}) or blank to unlink:",
-                initialvalue=current, parent=self)
-            if new is None:
-                return
-            new = new.strip()
-            if not new:
+    def _open_row_editor(self, row) -> None:
+        """Single-form row editor.  OK saves, Cancel discards."""
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Edit measurement row — {row.description}")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        # ----- Description -----
+        ttk.Label(dlg, text="Description:").grid(row=0, column=0, sticky=tk.W, padx=8, pady=(8, 2))
+        desc_var = tk.StringVar(value=row.description)
+        ttk.Entry(dlg, textvariable=desc_var, width=44).grid(row=0, column=1, columnspan=5, sticky=tk.EW, padx=8, pady=(8, 2))
+
+        # ----- Shape -----
+        ttk.Label(dlg, text="Shape:").grid(row=1, column=0, sticky=tk.W, padx=8, pady=2)
+        shape_var = tk.StringVar(value=row.shape)
+        shape_combo = ttk.Combobox(dlg, textvariable=shape_var, width=14, state="readonly",
+                                   values=(SHAPE_RECT, SHAPE_TRI))
+        shape_combo.grid(row=1, column=1, sticky=tk.W, padx=8, pady=2)
+
+        # ----- Polygon link -----
+        ttk.Label(dlg, text="Polygon link:").grid(row=1, column=2, sticky=tk.W, padx=(16, 4), pady=2)
+        poly_var = tk.StringVar(value="" if row.polygon_idx is None else str(row.polygon_idx + 1))
+        ttk.Entry(dlg, textvariable=poly_var, width=6).grid(row=1, column=3, sticky=tk.W, padx=4, pady=2)
+        ttk.Label(dlg, text=f"(1..{len(self.polygons)} or blank)").grid(row=1, column=4, columnspan=2, sticky=tk.W, pady=2)
+
+        # ----- Sub-segments grid:  H1 H2 H3   V1 V2 V3  each with (ft, in) -----
+        seg_frame = ttk.LabelFrame(dlg, text="Sub-segments (feet, inches)", padding=8)
+        seg_frame.grid(row=2, column=0, columnspan=6, sticky=tk.EW, padx=8, pady=8)
+        for col, lbl in enumerate(["H1", "H2", "H3", "V1", "V2", "V3"]):
+            ttk.Label(seg_frame, text=lbl, font=("Segoe UI", 9, "bold")).grid(row=0, column=col * 2, columnspan=2, padx=4)
+        h_vars = []  # list of (ft_var, in_var) for H1..H3
+        v_vars = []
+        ft_entries, in_entries = [], []
+        for i in range(3):
+            h_ft = tk.StringVar(value=str(row.h_subs[i][0]))
+            h_in = tk.StringVar(value=str(row.h_subs[i][1]))
+            v_ft = tk.StringVar(value=str(row.v_subs[i][0]))
+            v_in = tk.StringVar(value=str(row.v_subs[i][1]))
+            h_vars.append((h_ft, h_in))
+            v_vars.append((v_ft, v_in))
+            ttk.Entry(seg_frame, textvariable=h_ft, width=6, justify=tk.RIGHT).grid(row=1, column=i * 2, padx=2, pady=2)
+            ttk.Entry(seg_frame, textvariable=h_in, width=6, justify=tk.RIGHT).grid(row=1, column=i * 2 + 1, padx=2, pady=2)
+            ttk.Entry(seg_frame, textvariable=v_ft, width=6, justify=tk.RIGHT).grid(row=2, column=i * 2, padx=2, pady=2)
+            ttk.Entry(seg_frame, textvariable=v_in, width=6, justify=tk.RIGHT).grid(row=2, column=i * 2 + 1, padx=2, pady=2)
+            ft_entries.append(h_ft); ft_entries.append(v_ft)
+            in_entries.append(h_in); in_entries.append(v_in)
+        ttk.Label(seg_frame, text="H:", foreground="#666").grid(row=1, column=6, sticky=tk.W, padx=4)
+        ttk.Label(seg_frame, text="V:", foreground="#666").grid(row=2, column=6, sticky=tk.W, padx=4)
+
+        # ----- Live preview area -----
+        preview_var = tk.StringVar(value="")
+        ttk.Label(seg_frame, textvariable=preview_var,
+                  font=("Consolas", 10, "bold"), foreground="#0066cc").grid(
+            row=3, column=0, columnspan=7, pady=(6, 0))
+
+        def _parse_pair(ft_var, in_var):
+            try:
+                ft = float(ft_var.get())
+            except (ValueError, tk.TclError):
+                ft = 0.0
+            try:
+                inch = float(in_var.get())
+            except (ValueError, tk.TclError):
+                inch = 0.0
+            return max(0.0, ft), max(0.0, inch)
+
+        def _update_preview(*_):
+            try:
+                h = sum(_parse_pair(f, i)[0] + _parse_pair(f, i)[1] / 12.0 for f, i in h_vars)
+                v = sum(_parse_pair(f, i)[0] + _parse_pair(f, i)[1] / 12.0 for f, i in v_vars)
+                factor = SHAPE_FACTORS.get(shape_var.get(), 1.0)
+                area = h * v * factor
+                preview_var.set(
+                    f"H total = {h:.3f} ft   V total = {v:.3f} ft   "
+                    f"factor = {factor:g}   Area = {area:,.2f} sqft  ({area/10.7639:,.2f} m\u00b2)")
+            except Exception:
+                preview_var.set("(invalid input)")
+
+        for var in ft_entries + in_entries + [shape_var]:
+            var.trace_add("write", _update_preview)
+        _update_preview()
+
+        # ----- Buttons -----
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.grid(row=3, column=0, columnspan=6, sticky=tk.EW, padx=8, pady=(0, 8))
+        ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=4)
+
+        def _save():
+            new_h, new_v = [], []
+            for f_var, i_var in h_vars:
+                ft, inch = _parse_pair(f_var, i_var)
+                new_h.append((ft, inch))
+            for f_var, i_var in v_vars:
+                ft, inch = _parse_pair(f_var, i_var)
+                new_v.append((ft, inch))
+            row.h_subs = new_h
+            row.v_subs = new_v
+            sh = shape_var.get()
+            if sh in SHAPE_FACTORS:
+                row.shape = sh
+                row.factor = SHAPE_FACTORS[sh]
+            d = desc_var.get().strip()
+            if d:
+                row.description = d
+            poly_text = poly_var.get().strip()
+            if not poly_text:
                 row.polygon_idx = None
             else:
                 try:
-                    n = int(new)
+                    n = int(poly_text)
                     if 1 <= n <= len(self.polygons):
                         row.polygon_idx = n - 1
                     else:
-                        messagebox.showerror("Polygon link", f"Polygon must be 1..{len(self.polygons)}")
+                        messagebox.showerror("Polygon link", f"Polygon must be 1..{len(self.polygons)}", parent=dlg)
+                        return
                 except ValueError:
-                    messagebox.showerror("Polygon link", "Enter a number, or leave blank.")
-        else:
-            return
-        self._refresh_measurement_sheet()
+                    messagebox.showerror("Polygon link", "Enter a number, or leave blank.", parent=dlg)
+                    return
+            dlg.destroy()
+            self._refresh_measurement_sheet()
+
+        ttk.Button(btn_frame, text="Save", command=_save).pack(side=tk.RIGHT, padx=4)
+
+        # Keyboard: Enter saves, Esc cancels
+        dlg.bind("<Return>", lambda e: _save())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+        # Center on parent
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{x}+{y}")
+
+        # Initial focus
+        dlg.focus_set()
 
     def _export_measurement_sheet_xlsx(self) -> None:
         if not self.measurement_rows:

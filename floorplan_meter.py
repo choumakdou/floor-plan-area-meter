@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Build metadata — stamped by the GitHub Actions workflow on every build.
 # When running from source these fall back to the dev defaults below.
 # --- build metadata ---
-__version__ = "2.4.0-rect-edits"
+__version__ = "2.4.1-row-sync"
 __build__ = "local"
 __built_at__ = ""
 
@@ -896,6 +896,9 @@ class App(tk.Tk):
         poly.insert(new_vi, (ix, iy))
         self.selected_polygon = pi
         self.selected_vertex = new_vi
+        # v2.4.1: sync linked measurement rows to the inserted-vertex polygon
+        self._sync_rows_to_polygon(pi)
+        self._refresh_measurement_sheet()
         self._schedule_redraw()
 
     def _commit_rectangle(self, p1: Point, p2: Point) -> None:
@@ -963,12 +966,65 @@ class App(tk.Tk):
         )
         self.measurement_rows.append(row)
 
+    def _sync_row_to_polygon(self, row: "MeasurementRow",
+                              polygon: Polygon) -> None:
+        """v2.4.1: re-derive H/V sub-segments of a row from a polygon's
+        current axis-aligned bounding box (in pixels), converted to real
+        units via the calibration.
+
+        Updates h_subs[0] and v_subs[0]; zeros h_subs[1..2] and v_subs[1..2].
+        If the calibration unit is feet, splits the real length into
+        (feet, inches).  If not calibrated, leaves the row alone.
+
+        This is called whenever a polygon mutates (vertex drag, whole-
+        polygon drag, vertex insert/delete) so that the linked row's
+        arithmetic area tracks the polygon.  The cross-check Delta %
+        then stays meaningful as a sanity check.
+        """
+        if not self.calib.ready:
+            return
+        if len(polygon) < 3:
+            return
+        xs = [p[0] for p in polygon]
+        ys = [p[1] for p in polygon]
+        w_px = max(xs) - min(xs)
+        h_px = max(ys) - min(ys)
+        h_real = self.calib.real_per_px_h() * w_px
+        v_real = self.calib.real_per_px_v() * h_px
+        if self.calib.unit == "ft":
+            from math import modf
+            def _to_ft_in(real_ft):
+                ft_i = int(real_ft) if real_ft >= 0 else 0
+                inches = round((real_ft - ft_i) * 12, 2)
+                if inches >= 11.995:
+                    ft_i += 1
+                    inches = 0.0
+                return (float(ft_i), float(inches))
+            h_ft, h_in = _to_ft_in(h_real)
+            v_ft, v_in = _to_ft_in(v_real)
+        else:  # metres
+            h_ft, h_in = round(h_real, 3), 0.0
+            v_ft, v_in = round(v_real, 3), 0.0
+        row.h_subs = [(h_ft, h_in), (0.0, 0.0), (0.0, 0.0)]
+        row.v_subs = [(v_ft, v_in), (0.0, 0.0), (0.0, 0.0)]
+
+    def _sync_rows_to_polygon(self, polygon_idx: int) -> None:
+        """Sync every measurement row linked to the given polygon, then
+        refresh the sheet.  Cheap when there are no linked rows.
+        """
+        for row in self.measurement_rows:
+            if row.polygon_idx == polygon_idx:
+                self._sync_row_to_polygon(row, self.polygons[polygon_idx]["poly"])
+
     def on_right_click(self, event):
         if self.mode.get() == "edit" and self.selected_polygon is not None and self.selected_vertex is not None:
             poly = self.polygons[self.selected_polygon]["poly"]
             if len(poly) > 3:
                 del poly[self.selected_vertex]
                 self.selected_vertex = None
+                # v2.4.1: sync linked measurement rows to the deleted-vertex polygon
+                self._sync_rows_to_polygon(self.selected_polygon)
+                self._refresh_measurement_sheet()
                 self._schedule_redraw()
                 return
         self.close_polygon()
@@ -1011,6 +1067,9 @@ class App(tk.Tk):
                 # Replace the polygon vertices in-place
                 for i, (x, y) in enumerate(new_poly):
                     poly[i] = (x, y)
+                # v2.4.1: sync linked measurement rows to the new polygon shape
+                self._sync_rows_to_polygon(self.selected_polygon)
+                self._refresh_measurement_sheet()
                 self._schedule_redraw()
             return
 
@@ -1059,6 +1118,9 @@ class App(tk.Tk):
             poly = self.polygons[self.selected_polygon]["poly"]
             for i, (ox, oy) in enumerate(self._polygon_drag_original):
                 poly[i] = (ox + dx + shift_x, oy + dy + shift_y)
+            # v2.4.1: sync linked measurement rows to the moved polygon
+            self._sync_rows_to_polygon(self.selected_polygon)
+            self._refresh_measurement_sheet()
             self._schedule_redraw()
             return
 

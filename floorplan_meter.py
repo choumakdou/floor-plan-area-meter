@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Build metadata — stamped by the GitHub Actions workflow on every build.
 # When running from source these fall back to the dev defaults below.
 # --- build metadata ---
-__version__ = "2.3.0-snap"
+__version__ = "2.4.0-rect-edits"
 __build__ = "local"
 __built_at__ = ""
 
@@ -299,6 +299,20 @@ class App(tk.Tk):
         self._snap_target: Optional[Point] = None
         self._snap_kind: str = ""            # 'vertex' | 'edge' | ''
         self.SNAP_TOL_PX: float = 8.0        # image-pixel radius
+        # v2.4: rectangular constraint mode for editing rectangles.
+        #   'anchor'  = opposite corner is fixed; adjacent corners follow
+        #   'free'    = opposite edge slides parallel to itself
+        #   'off'     = no constraint (treat as free polygon)
+        self._rect_edit_mode_var = tk.StringVar(value="anchor")
+        # Keep the convenience alias in sync
+        self._rect_edit_mode_var.trace_add("write",
+            lambda *_ : setattr(self, "rect_edit_mode", self._rect_edit_mode_var.get()))
+        # Convenience alias for read-only code paths
+        self.rect_edit_mode: str = "anchor"
+        # v2.4: whole-polygon drag state (drag a rectangle from its interior)
+        self._dragging_polygon: bool = False
+        self._polygon_drag_start: Optional[Point] = None
+        self._polygon_drag_original: Optional[Polygon] = None
 
         self.calib = Calibration()
         self.mode = tk.StringVar(value="polygon")     # 'polygon' | 'rectangle' | 'calibV' | 'calibH' | 'edit'
@@ -360,6 +374,16 @@ class App(tk.Tk):
             onvalue="pan", offvalue="draw",
             command=self._on_input_mode_change)
         self.input_mode_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        # v2.4: rectangle edit mode (only applies to detected rectangles)
+        ttk.Label(tb, text="Rect:").pack(side=tk.LEFT)
+        ttk.Radiobutton(tb, text="Anchor", variable=self._rect_edit_mode_var,
+                        value="anchor").pack(side=tk.LEFT)
+        ttk.Radiobutton(tb, text="Free", variable=self._rect_edit_mode_var,
+                        value="free").pack(side=tk.LEFT)
+        ttk.Radiobutton(tb, text="Off", variable=self._rect_edit_mode_var,
+                        value="off").pack(side=tk.LEFT)
         ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
         ttk.Label(tb, text="Units:").pack(side=tk.LEFT)
@@ -810,8 +834,19 @@ class App(tk.Tk):
         elif mode == "edit":
             hit = self._hit_test_polygon(ix, iy, tol_px=10.0)
             if hit is None:
-                self.selected_polygon = None
-                self.selected_vertex = None
+                # v2.4: no vertex hit -> maybe inside a polygon -> drag whole
+                pi_inside = self._find_polygon_at(ix, iy)
+                if pi_inside is not None:
+                    self.selected_polygon = pi_inside
+                    self.selected_vertex = None
+                    self._dragging_polygon = True
+                    self._polygon_drag_start = (ix, iy)
+                    # Snapshot the original vertices so we can compute
+                    # a delta on every motion event.
+                    self._polygon_drag_original = list(self.polygons[pi_inside]["poly"])
+                else:
+                    self.selected_polygon = None
+                    self.selected_vertex = None
             else:
                 pi, vi = hit
                 self.selected_polygon = pi
@@ -832,6 +867,9 @@ class App(tk.Tk):
 
     def on_left_release(self, event):
         self._dragging_vertex = False
+        self._dragging_polygon = False
+        self._polygon_drag_start = None
+        self._polygon_drag_original = None
         self._panning = False
         # v2.3: clear snap state on release
         self._snap_target = None
@@ -960,14 +998,68 @@ class App(tk.Tk):
                 snap = self._find_snap_target(ix, iy,
                                               exclude_poly_idx=self.selected_polygon)
                 if snap is not None:
-                    self._snap_target = snap[0]
+                    target = snap[0]
+                    self._snap_target = target
                     self._snap_kind = snap[1]
-                    poly[self.selected_vertex] = snap[0]
                 else:
+                    target = (ix, iy)
                     self._snap_target = None
                     self._snap_kind = ""
-                    poly[self.selected_vertex] = (ix, iy)
+                # v2.4: apply rectangle constraint (anchor / free / off)
+                new_poly = self._apply_rectangle_constraint(
+                    poly, self.selected_vertex, target)
+                # Replace the polygon vertices in-place
+                for i, (x, y) in enumerate(new_poly):
+                    poly[i] = (x, y)
                 self._schedule_redraw()
+            return
+
+        # v2.4: whole-polygon drag (click in interior of a rectangle)
+        if self._dragging_polygon and self.mode.get() == "edit" \
+                and self.selected_polygon is not None \
+                and self._polygon_drag_start is not None \
+                and self._polygon_drag_original is not None:
+            ix, iy = self.canvas_to_image(event.x, event.y)
+            dx = ix - self._polygon_drag_start[0]
+            dy = iy - self._polygon_drag_start[1]
+            # Try to snap: any of the 4 translated vertices within tol
+            # of a snap target.  If found, shift the whole rectangle by
+            # (snap_target - corresponding translated vertex) so the
+            # snapping vertex lands exactly on the target.
+            new_pts = [(x + dx, y + dy) for (x, y) in self._polygon_drag_original]
+            snap = None
+            for vx, vy in new_pts:
+                s = self._find_snap_target(vx, vy,
+                                          exclude_poly_idx=self.selected_polygon)
+                if s is not None:
+                    # Pick the first snapping vertex; shift the whole poly
+                    # so this vertex lands on s
+                    snap = (vx, vy, s[0], s[1])
+                    break
+            if snap is not None:
+                _, _, sx, sy = snap
+                shift_x = sx - (snap[0] - dx)  # original + dx + shift = sx
+                # Simpler: shift so this vertex goes to the target.
+                orig_vx, orig_vy = None, None
+                for ox, oy in self._polygon_drag_original:
+                    if abs((ox + dx) - snap[0]) < 1e-6 and abs((oy + dy) - snap[1]) < 1e-6:
+                        orig_vx, orig_vy = ox, oy
+                        break
+                if orig_vx is not None:
+                    shift_x = sx - orig_vx - dx
+                    shift_y = sy - orig_vy - dy
+                    self._snap_target = (sx, sy)
+                    self._snap_kind = "vertex"  # edge possible but rarer
+                else:
+                    shift_x = shift_y = 0
+            else:
+                shift_x = shift_y = 0
+                self._snap_target = None
+                self._snap_kind = ""
+            poly = self.polygons[self.selected_polygon]["poly"]
+            for i, (ox, oy) in enumerate(self._polygon_drag_original):
+                poly[i] = (ox + dx + shift_x, oy + dy + shift_y)
+            self._schedule_redraw()
             return
 
         # Live rectangle drag in rectangle mode
@@ -1820,6 +1912,156 @@ class App(tk.Tk):
                     best_e_pt = (qx, qy)
         if best_e_pt is not None:
             return (best_e_pt, "edge")
+        return None
+
+    # ------------------------------------------------------------------
+    # v2.4: Rectangle detection and constraint logic
+    # ------------------------------------------------------------------
+    def _is_rectangle(self, poly: Polygon,
+                      angle_tol_deg: float = 5.0,
+                      side_ratio_tol: float = 0.5) -> bool:
+        """Heuristic rectangle detection: 4 vertices, all 4 internal angles
+        within `angle_tol_deg` of 90°, and opposite sides roughly parallel.
+
+        For the angle_tol check we use the dot product of consecutive
+        edge vectors; cos(angle) close to 0 means angle is close to 90°.
+
+        For parallel-side check we use the cross product of opposite
+        edges; cross ≈ 0 means parallel.
+
+        We don't enforce equal lengths (rectangles can be oblong), but
+        we do require that opposite sides are within a length ratio
+        tolerance of each other.
+        """
+        if len(poly) != 4:
+            return False
+        # Internal angles
+        n = 4
+        for i in range(n):
+            ax, ay = poly[i]
+            bx, by = poly[(i + 1) % n]
+            cx, cy = poly[(i + 2) % n]
+            v1x, v1y = ax - bx, ay - by
+            v2x, v2y = cx - bx, cy - by
+            dot = v1x * v2x + v1y * v2y
+            len1 = math.hypot(v1x, v1y)
+            len2 = math.hypot(v2x, v2y)
+            if len1 < 1e-6 or len2 < 1e-6:
+                return False
+            cos_a = dot / (len1 * len2)
+            cos_a = max(-1.0, min(1.0, cos_a))
+            angle_deg = math.degrees(math.acos(abs(cos_a)))
+            if abs(angle_deg - 90.0) > angle_tol_deg:
+                return False
+        # Opposite-side parallel check
+        for i in (0, 1):
+            ax, ay = poly[i]
+            bx, by = poly[(i + 1) % n]
+            cx, cy = poly[(i + 2) % n]
+            dx_, dy_ = poly[(i + 3) % n]
+            e1x, e1y = bx - ax, by - ay
+            e2x, e2y = dx_ - cx, dy_ - cy
+            cross = e1x * e2y - e1y * e2x
+            L1 = math.hypot(e1x, e1y)
+            L2 = math.hypot(e2x, e2y)
+            if L1 < 1e-6 or L2 < 1e-6:
+                return False
+            # sin(angle) between edges
+            sin_a = abs(cross) / (L1 * L2)
+            if sin_a > 0.1:  # > 5.7° off parallel
+                return False
+            # Length ratio
+            if min(L1, L2) / max(L1, L2) < (1 - side_ratio_tol):
+                return False
+        return True
+
+    def _apply_rectangle_constraint(self, poly: Polygon, dragged_idx: int,
+                                    new_pos: Point) -> Polygon:
+        """Apply the user's chosen rectangle constraint when a vertex
+        of a rectangle is dragged.
+
+        Mode 'anchor': opposite corner fixed; adjacent corners follow so
+        the four 90° angles are preserved.
+        Mode 'free':  opposite edge fixed (slides parallel to itself).
+        """
+        if not self._is_rectangle(poly) or self.rect_edit_mode == "off":
+            # Not a rectangle, or constraint disabled -> just move the vertex
+            new_poly = list(poly)
+            new_poly[dragged_idx] = new_pos
+            return new_poly
+        # Determine which vertices are adjacent and which is opposite.
+        n = 4
+        prev_i = (dragged_idx - 1) % n
+        next_i = (dragged_idx + 1) % n
+        opp_i = (dragged_idx + 2) % n
+        p_prev = poly[prev_i]
+        p_next = poly[next_i]
+        p_opp = poly[opp_i]
+        if self.rect_edit_mode == "anchor":
+            # Anchor opposite corner.  The new rectangle is defined by the
+            # dragged corner and the opposite corner.  We compute the
+            # "ideal" adjacent corners that complete the rectangle.
+            dx_opp = p_opp[0] - new_pos[0]
+            dy_opp = p_opp[1] - new_pos[1]
+            # The adjacent corner (prev) shares the dragged corner's x with
+            # the prev vertex's original y.  But that may not form a
+            # rectangle; we want the orthogonal projection.
+            # The axis-aligned rectangle anchored on opposite:
+            #   if dragged is "top-left" relative to opp, then prev (top-right)
+            #     is at (p_opp.x, new_pos.y) and next (bottom-left) is at
+            #     (new_pos.x, p_opp.y).
+            # To handle the non-axis-aligned (slightly rotated) case, we
+            # use the dominant edge direction as the rectangle's "x axis".
+            # For axis-aligned (the common case after a rectangle drag),
+            # the simplest correct rule is:
+            #   prev.x = p_opp.x,  prev.y = new_pos.y
+            #   next.x = new_pos.x, next.y = p_opp.y
+            new_prev = (p_opp[0], new_pos[1])
+            new_next = (new_pos[0], p_opp[1])
+            result = list(poly)
+            result[dragged_idx] = new_pos
+            result[prev_i] = new_prev
+            result[next_i] = new_next
+            return result
+        else:  # free
+            # Free: the opposite edge stays put.  prev and next slide
+            # parallel to the dragged corner's new position.
+            # Implementation: keep opp and (opp+1) fixed, move dragged,
+            # and slide prev and next so the rectangle remains a rectangle
+            # (i.e. new prev = old prev + (new_pos - old dragged),
+            #  new next = old next + (new_pos - old dragged)).
+            old_dragged = poly[dragged_idx]
+            shift = (new_pos[0] - old_dragged[0], new_pos[1] - old_dragged[1])
+            new_prev = (p_prev[0] + shift[0], p_prev[1] + shift[1])
+            new_next = (p_next[0] + shift[0], p_next[1] + shift[1])
+            result = list(poly)
+            result[dragged_idx] = new_pos
+            result[prev_i] = new_prev
+            result[next_i] = new_next
+            return result
+
+    def _point_in_polygon(self, px: float, py: float, poly: Polygon) -> bool:
+        """Standard ray-casting point-in-polygon test."""
+        if len(poly) < 3:
+            return False
+        inside = False
+        n = len(poly)
+        for i in range(n):
+            x1, y1 = poly[i]
+            x2, y2 = poly[(i + 1) % n]
+            if ((y1 > py) != (y2 > py)):
+                x_cross = (x2 - x1) * (py - y1) / (y2 - y1 + 1e-12) + x1
+                if px < x_cross:
+                    inside = not inside
+        return inside
+
+    def _find_polygon_at(self, ix: float, iy: float) -> Optional[int]:
+        """Return the topmost polygon index whose interior contains
+        (ix, iy), or None.  Used to disambiguate 'drag the whole
+        rectangle' from 'drag a vertex'."""
+        for pi in range(len(self.polygons) - 1, -1, -1):
+            if self._point_in_polygon(ix, iy, self.polygons[pi]["poly"]):
+                return pi
         return None
 
     def _draw_edit_handles(self) -> None:

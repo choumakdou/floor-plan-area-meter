@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Build metadata — stamped by the GitHub Actions workflow on every build.
 # When running from source these fall back to the dev defaults below.
 # --- build metadata ---
-__version__ = "2.1.1-row-editor"
+__version__ = "2.2.0-rotation-rect"
 __build__ = "local"
 __built_at__ = ""
 
@@ -282,6 +282,11 @@ class App(tk.Tk):
         self.offset = (0.0, 0.0)        # pan offset in canvas coords
         self._panning = False
         self._pan_start = (0.0, 0.0)
+        # v2.2: image rotation in degrees (CCW positive).  Applied to the
+        # displayed image, NOT the source file.  Polygons, calibration points,
+        # and measurement rows stay in unrotated image-pixel space; the
+        # rotation is applied as a pre-render transform on the image only.
+        self.rotation_deg: float = 0.0
 
         self.calib = Calibration()
         self.mode = tk.StringVar(value="polygon")     # 'polygon' | 'calibV' | 'calibH' | 'edit'
@@ -372,6 +377,19 @@ class App(tk.Tk):
         ttk.Button(tb, text="Zoom −", command=lambda: self.zoom_by(1 / self.ZOOM_STEP)).pack(side=tk.LEFT, padx=2)
         ttk.Button(tb, text="Fit", command=self.fit_to_window).pack(side=tk.LEFT, padx=2)
         ttk.Button(tb, text="100%", command=lambda: self.set_zoom(1.0)).pack(side=tk.LEFT, padx=2)
+
+        # v2.2: image rotation controls
+        ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Label(tb, text="Rot \u00b0:").pack(side=tk.LEFT)
+        self.rotation_var = tk.StringVar(value="0.00")
+        rot_entry = ttk.Entry(tb, textvariable=self.rotation_var, width=7, justify=tk.RIGHT)
+        rot_entry.pack(side=tk.LEFT, padx=2)
+        rot_entry.bind("<Return>", lambda e: self._apply_rotation_from_entry())
+        rot_entry.bind("<FocusOut>", lambda e: self._apply_rotation_from_entry())
+        ttk.Button(tb, text="\u22120.05", command=lambda: self._nudge_rotation(-0.05)).pack(side=tk.LEFT)
+        ttk.Button(tb, text="+0.05", command=lambda: self._nudge_rotation(+0.05)).pack(side=tk.LEFT)
+        ttk.Button(tb, text="Snap V\u2192", command=self._snap_rotation_to_v).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(tb, text="Reset", command=self._reset_rotation).pack(side=tk.LEFT, padx=(2, 0))
 
         # Persistent stringvars that need to be created early
         self.unit_label_var = tk.StringVar(value="m")
@@ -568,19 +586,52 @@ class App(tk.Tk):
         self.current_poly.clear()
         self.poly_list.delete(0, tk.END)
         self.zoom = 1.0
+        self.rotation_deg = 0.0
+        if hasattr(self, "rotation_var"):
+            self.rotation_var.set("0.00")
         self.fit_to_window()
         self._update_status()
 
     # ------------------------------------------------------------------
     # Coordinate transforms
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # v2.2: rotation helpers.  Polygons / calibration / measurement rows
+    # are stored in unrotated image-pixel coordinates.  These helpers
+    # convert between unrotated image space and the rotated display
+    # space used for rendering.  When rotation_deg == 0, the helpers
+    # are no-ops.
+    #
+    # PIL's rotate(deg) is documented as CCW but in image coords (y down)
+    # it visually rotates CW for positive deg.  Our rotor mirrors that
+    # convention so the displayed polygon lines up with the rotated image.
+    # ------------------------------------------------------------------
+    def _rotor(self, x: float, y: float, inverse: bool = False) -> Tuple[float, float]:
+        """Rotate (x,y) by +/- self.rotation_deg around the image center."""
+        if abs(self.rotation_deg) < 1e-6 or self.image is None:
+            return x, y
+        iw, ih = self.image.size
+        cx, cy = iw / 2.0, ih / 2.0
+        # PIL: positive deg = CW visually.  We negate to get the standard
+        # math-CCW matrix, then negate back the sign for inverse.
+        ang = math.radians(self.rotation_deg if inverse else -self.rotation_deg)
+        cos_a, sin_a = math.cos(ang), math.sin(ang)
+        dx, dy = x - cx, y - cy
+        rx = dx * cos_a - dy * sin_a + cx
+        ry = dx * sin_a + dy * cos_a + cy
+        return rx, ry
+
     def canvas_to_image(self, cx: float, cy: float) -> Point:
         ox, oy = self.offset
-        return ((cx - ox) / self.zoom, (cy - oy) / self.zoom)
+        ix, iy = (cx - ox) / self.zoom, (cy - oy) / self.zoom
+        return self._rotor(ix, iy, inverse=True)
 
     def image_to_canvas(self, ix: float, iy: float) -> Point:
+        # Apply rotation FIRST (so the unrotated polygon vertex ends up
+        # at the right rotated-display position), then zoom + offset.
+        rx, ry = self._rotor(ix, iy, inverse=False)
         ox, oy = self.offset
-        return (ix * self.zoom + ox, iy * self.zoom + oy)
+        return (rx * self.zoom + ox, ry * self.zoom + oy)
 
     # ------------------------------------------------------------------
     # Zoom / pan
@@ -610,10 +661,78 @@ class App(tk.Tk):
         cw = max(self.canvas.winfo_width(), 1)
         ch = max(self.canvas.winfo_height(), 1)
         iw, ih = self.image.size
+        if abs(self.rotation_deg) > 1e-6:
+            # Match the rotated image's bounding box
+            iw, ih = self._rotated_image_size(iw, ih)
         z = min(cw / iw, ch / ih) * 0.98
         self.zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, z))
         self.offset = ((cw - iw * self.zoom) / 2, (ch - ih * self.zoom) / 2)
         self._schedule_redraw()
+
+    def _rotated_image_size(self, iw: int, ih: int) -> Tuple[int, int]:
+        """Bounding box of the image after rotation by self.rotation_deg."""
+        if abs(self.rotation_deg) < 1e-6:
+            return iw, ih
+        ang = math.radians(self.rotation_deg)
+        cos_a, sin_a = abs(math.cos(ang)), abs(math.sin(ang))
+        new_w = int(round(iw * cos_a + ih * sin_a))
+        new_h = int(round(iw * sin_a + ih * cos_a))
+        return new_w, new_h
+
+    # ------------------------------------------------------------------
+    # v2.2: Image rotation
+    # ------------------------------------------------------------------
+    def _apply_rotation_from_entry(self) -> None:
+        if self.image is None:
+            return
+        try:
+            deg = float(self.rotation_var.get())
+        except (ValueError, tk.TclError):
+            self.rotation_var.set(f"{self.rotation_deg:.2f}")
+            return
+        self._set_rotation(deg)
+
+    def _nudge_rotation(self, delta: float) -> None:
+        if self.image is None:
+            return
+        self._set_rotation(self.rotation_deg + delta)
+
+    def _reset_rotation(self) -> None:
+        self._set_rotation(0.0)
+
+    def _set_rotation(self, deg: float) -> None:
+        # Normalise to (-180, 180]
+        deg = ((deg + 180.0) % 360.0) - 180.0
+        if abs(deg - self.rotation_deg) < 1e-6:
+            return
+        self.rotation_deg = deg
+        self.rotation_var.set(f"{deg:.2f}")
+        # The rotated image is larger than the unrotated; re-fit so the
+        # user always sees the whole plan centred.
+        self.fit_to_window()
+
+    def _snap_rotation_to_v(self) -> None:
+        """Auto-rotate the image so the calibration V reference line
+        (p1 -> p2) is exactly vertical.  Useful for slightly-angled scans:
+        set V on a known-vertical wall, click Snap, done.
+        """
+        if self.image is None:
+            return
+        if self.calib.p1 is None or self.calib.p2 is None:
+            messagebox.showinfo("Snap V",
+                "Set the V calibration reference first (Calibrate V mode, two clicks).")
+            return
+        x1, y1 = self.calib.p1
+        x2, y2 = self.calib.p2
+        # Current angle of the V segment, measured from image-y axis.
+        # We want the segment to end up vertical (i.e. its angle from
+        # image-y to be 0).  In PIL, rotation is CCW.  The V line as
+        # drawn is at angle atan2(dx, dy) from the +y axis (CCW).
+        dx, dy = x2 - x1, y2 - y1
+        current_angle_from_vertical = math.degrees(math.atan2(dx, dy))
+        # To make it vertical, rotate the IMAGE by -current_angle_from_vertical
+        # (so the V segment, which rotates with the image, ends up vertical).
+        self._set_rotation(-current_angle_from_vertical)
 
     def on_mousewheel(self, event):
         if self.image is None:
@@ -1368,6 +1487,11 @@ class App(tk.Tk):
 
         # Render the scaled base on a transparent canvas
         rgba = self.image.convert("RGBA")
+        if abs(self.rotation_deg) > 1e-6:
+            # Rotate the image so polygons/calibration (drawn via
+            # image_to_canvas, which now applies the rotor) line up.
+            rgba = rgba.rotate(self.rotation_deg, resample=Image.BICUBIC, expand=True)
+            scaled_w, scaled_h = rgba.size
         scaled = rgba.resize((scaled_w, scaled_h), Image.LANCZOS)
         overlay = Image.new("RGBA", scaled.size, (0, 0, 0, 0))
         drw = ImageDraw.Draw(overlay, "RGBA")
@@ -1593,6 +1717,7 @@ class App(tk.Tk):
         data = {
             "image": self.image_path,
             "calib": self.calib.to_dict(),
+            "rotation_deg": self.rotation_deg,
             "polygons": [
                 {"poly": p["poly"], "color": p["color"], "name": p["name"]}
                 for p in self.polygons
@@ -1627,6 +1752,11 @@ class App(tk.Tk):
         self.current_poly.clear()
         # Restore measurement rows (v2.1).  Missing key -> empty list.
         self.measurement_rows = [MeasurementRow.from_dict(d) for d in data.get("measurement_rows", [])]
+        # Restore rotation (v2.2).  Missing key -> 0 deg.
+        try:
+            self._set_rotation(float(data.get("rotation_deg", 0.0)))
+        except (ValueError, TypeError):
+            self._set_rotation(0.0)
         self._refresh_measurement_sheet()
         self._refresh_calib_entries()
         self.fit_to_window()
